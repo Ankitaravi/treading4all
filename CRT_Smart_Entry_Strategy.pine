@@ -75,56 +75,56 @@ const string G_ENTRY = "4 · Entry"
 const string G_RISK  = "5 · Stop Loss & Targets"
 
 // ---------- Inputs: range ----------
-string rangeMode       = input.string(RM_HTF, "Range Source", options = [RM_PREV, RM_HTF, RM_OR, RM_FIRST, RM_CUSTOM], group = G_RANGE,
+string rangeMode       = input.string(RM_HTF, "Range Source", options = [RM_PREV, RM_HTF, RM_OR, RM_FIRST, RM_CUSTOM], group = G_RANGE, display = display.none,
       tooltip = "Previous Candle: the last closed chart candle.\nHigher Timeframe Candle: the last CLOSED candle of the selected HTF.\nSession Opening Range: first N minutes of the trading session.\nFirst Session Candle: first 5m or 15m of the session.\nCustom Session: high/low of a user-defined time window (e.g. Asia session).")
-string htfInput        = input.timeframe("60", "Higher Timeframe", group = G_RANGE, tooltip = "Used only by 'Higher Timeframe Candle'. Must be greater than the chart timeframe.")
-int    orMinutes       = input.int(15, "Opening Range Duration (minutes)", minval = 1, group = G_RANGE, tooltip = "Used only by 'Session Opening Range'. Chart timeframe should be ≤ this value for an exact range.")
-string firstCandleSize = input.string("15", "First Candle Size (minutes)", options = ["5", "15"], group = G_RANGE, tooltip = "Used only by 'First Session Candle'. Chart timeframe should be ≤ this value.")
-bool   resetOnNewRange = input.bool(true, "Reset pending setups when a new range starts", group = G_RANGE, tooltip = "Ignored in 'Previous Candle' mode (a new range starts every bar there; pending setups keep their own snapshot of the swept level and expire by their timeouts).")
-int    maxSignalsPerRange = input.int(1, "Max signals per range (per direction)", minval = 1, maxval = 20, group = G_RANGE)
+string htfInput        = input.timeframe("60", "Higher Timeframe", group = G_RANGE, display = display.none, tooltip = "Used only by 'Higher Timeframe Candle'. Must be greater than the chart timeframe.")
+int    orMinutes       = input.int(15, "Opening Range Duration (minutes)", minval = 1, group = G_RANGE, display = display.none, tooltip = "Used only by 'Session Opening Range'. Chart timeframe should be ≤ this value for an exact range.")
+string firstCandleSize = input.string("15", "First Candle Size (minutes)", options = ["5", "15"], group = G_RANGE, display = display.none, tooltip = "Used only by 'First Session Candle'. Chart timeframe should be ≤ this value.")
+bool   resetOnNewRange = input.bool(true, "Reset pending setups when a new range starts", group = G_RANGE, display = display.none, tooltip = "Ignored in 'Previous Candle' mode (a new range starts every bar there; pending setups keep their own snapshot of the swept level and expire by their timeouts).")
+int    maxSignalsPerRange = input.int(1, "Max signals per range (per direction)", minval = 1, maxval = 20, group = G_RANGE, display = display.none)
 
 // ---------- Inputs: sessions ----------
-string sessSource = input.string(SS_AUTO, "Session Start Source", options = [SS_AUTO, SS_MANUAL], group = G_SESS,
+string sessSource = input.string(SS_AUTO, "Session Start Source", options = [SS_AUTO, SS_MANUAL], group = G_SESS, display = display.none,
       tooltip = "Symbol Session (auto): uses the symbol's own regular session from TradingView (first regular bar of each session).\nManual Session: uses the session string below in the selected timezone.")
-string sessInput  = input.session("0000-0000", "Manual Trading Session", group = G_SESS, tooltip = "Used when Session Start Source = Manual. '0000-0000' = 24h session (starts each new day in the selected timezone).")
-string customSess = input.session("0000-0600", "Custom Range Session", group = G_SESS, tooltip = "Used only by 'Custom Session' range source. Range locks when this window ends.")
-string tzInput    = input.string("Exchange", "Timezone", group = G_SESS, tooltip = "'Exchange' = the symbol's exchange timezone. Otherwise an IANA name (e.g. 'Asia/Kolkata', 'America/New_York', 'UTC') or 'GMT+5:30'.")
-bool   useSignalSess = input.bool(false, "Only allow entries inside a signal session", group = G_SESS)
-string signalSess = input.session("0000-0000", "Signal Session", group = G_SESS)
+string sessInput  = input.session("0000-0000", "Manual Trading Session", group = G_SESS, display = display.none, tooltip = "Used when Session Start Source = Manual. '0000-0000' = 24h session (starts each new day in the selected timezone).")
+string customSess = input.session("0000-0600", "Custom Range Session", group = G_SESS, display = display.none, tooltip = "Used only by 'Custom Session' range source. Range locks when this window ends.")
+string tzInput    = input.string("Exchange", "Timezone", group = G_SESS, display = display.none, tooltip = "'Exchange' = the symbol's exchange timezone. Otherwise an IANA name (e.g. 'Asia/Kolkata', 'America/New_York', 'UTC') or 'GMT+5:30'.")
+bool   useSignalSess = input.bool(false, "Only allow entries inside a signal session", group = G_SESS, display = display.none)
+string signalSess = input.session("0000-0000", "Signal Session", group = G_SESS, display = display.none)
 
 // ---------- Inputs: sweep ----------
-string sweepType      = input.string(SW_WICK, "Sweep Detection", options = [SW_WICK, SW_CLOSE], group = G_SWEEP,
+string sweepType      = input.string(SW_WICK, "Sweep Detection", options = [SW_WICK, SW_CLOSE], group = G_SWEEP, display = display.none,
       tooltip = "Wick: a high/low beyond the range boundary counts as a sweep.\nClose Beyond: the candle must also CLOSE beyond the boundary (reclaim must then happen on a later bar).")
-string confirmMode    = input.string(CF_CLOSE, "Sweep Confirmation", options = [CF_CLOSE, CF_REJECT], group = G_SWEEP,
+string confirmMode    = input.string(CF_CLOSE, "Sweep Confirmation", options = [CF_CLOSE, CF_REJECT], group = G_SWEEP, display = display.none,
       tooltip = "Close Back Inside: a close back inside the range.\nRejection Candle: close back inside + candle body in the trade direction + rejection wick ≥ the % below.")
-int    maxReclaimBars = input.int(3, "Max bars to confirm (reclaim)", minval = 0, maxval = 50, group = G_SWEEP, tooltip = "0 = the reclaim must happen on the sweep candle itself.")
-string minSweepMode   = input.string(MD_NONE, "Minimum Sweep Distance", options = [MD_NONE, MD_TICKS, MD_ATR, MD_PCT], group = G_SWEEP, inline = "msd")
-float  minSweepValue  = input.float(0.0, "", minval = 0.0, step = 0.05, group = G_SWEEP, inline = "msd")
-float  rejWickPct     = input.float(40.0, "Rejection wick ≥ % of candle", minval = 0.0, maxval = 100.0, group = G_SWEEP)
+int    maxReclaimBars = input.int(3, "Max bars to confirm (reclaim)", minval = 0, maxval = 50, group = G_SWEEP, display = display.none, tooltip = "0 = the reclaim must happen on the sweep candle itself.")
+string minSweepMode   = input.string(MD_NONE, "Minimum Sweep Distance", options = [MD_NONE, MD_TICKS, MD_ATR, MD_PCT], group = G_SWEEP, display = display.none, inline = "msd")
+float  minSweepValue  = input.float(0.0, "", minval = 0.0, step = 0.05, group = G_SWEEP, display = display.none, inline = "msd")
+float  rejWickPct     = input.float(40.0, "Rejection wick ≥ % of candle", minval = 0.0, maxval = 100.0, group = G_SWEEP, display = display.none)
 
 // ---------- Inputs: MSS ----------
-int    pivotLeft    = input.int(3, "Pivot Left Bars", minval = 1, maxval = 50, group = G_MSS)
-int    pivotRight   = input.int(2, "Pivot Right Bars (confirmation delay)", minval = 1, maxval = 50, group = G_MSS,
+int    pivotLeft    = input.int(3, "Pivot Left Bars", minval = 1, maxval = 50, group = G_MSS, display = display.none)
+int    pivotRight   = input.int(2, "Pivot Right Bars (confirmation delay)", minval = 1, maxval = 50, group = G_MSS, display = display.none,
       tooltip = "A swing is confirmed only after this many bars have closed to its right. This delay is intentional and prevents repainting pivots.")
-string mssBreakType = input.string(BRK_CLOSE, "MSS Break Type", options = [BRK_CLOSE, BRK_WICK], group = G_MSS)
-int    maxBarsToMss = input.int(20, "Max bars from sweep confirmation to MSS", minval = 1, maxval = 500, group = G_MSS)
-int    swingMaxAge  = input.int(100, "Max swing age (bars)", minval = 5, maxval = 1000, group = G_MSS, tooltip = "Only swings formed within this many bars are used as MSS / structure-stop references.")
+string mssBreakType = input.string(BRK_CLOSE, "MSS Break Type", options = [BRK_CLOSE, BRK_WICK], group = G_MSS, display = display.none)
+int    maxBarsToMss = input.int(20, "Max bars from sweep confirmation to MSS", minval = 1, maxval = 500, group = G_MSS, display = display.none)
+int    swingMaxAge  = input.int(100, "Max swing age (bars)", minval = 5, maxval = 1000, group = G_MSS, display = display.none, tooltip = "Only swings formed within this many bars are used as MSS / structure-stop references.")
 
 // ---------- Inputs: entry ----------
-string entryMode     = input.string(EM_CONFIRM, "Entry Mode", options = [EM_CONFIRM, EM_RETEST], group = G_ENTRY)
-float  retestTolAtr  = input.float(0.10, "Retest tolerance (× ATR)", minval = 0.0, step = 0.05, group = G_ENTRY)
-int    maxRetestBars = input.int(10, "Max bars to wait for retest", minval = 1, maxval = 200, group = G_ENTRY)
+string entryMode     = input.string(EM_CONFIRM, "Entry Mode", options = [EM_CONFIRM, EM_RETEST], group = G_ENTRY, display = display.none)
+float  retestTolAtr  = input.float(0.10, "Retest tolerance (× ATR)", minval = 0.0, step = 0.05, group = G_ENTRY, display = display.none)
+int    maxRetestBars = input.int(10, "Max bars to wait for retest", minval = 1, maxval = 200, group = G_ENTRY, display = display.none)
 
 // ---------- Inputs: risk ----------
-string slMethod    = input.string(SL_SWEEP, "Stop-Loss Method", options = [SL_SWEEP, SL_SWING, SL_ATR], group = G_RISK)
-int    atrLen      = input.int(14, "ATR Length", minval = 1, group = G_RISK)
-float  slAtrMult   = input.float(1.5, "ATR Stop Multiple", minval = 0.1, step = 0.1, group = G_RISK)
-float  slBufferAtr = input.float(0.05, "Stop Buffer (× ATR)", minval = 0.0, step = 0.01, group = G_RISK, tooltip = "Extra distance beyond the sweep extreme / swing. Not applied to ATR-based stops.")
-float  maxRiskAtr  = input.float(0.0, "Max Risk (× ATR, 0 = off)", minval = 0.0, step = 0.5, group = G_RISK)
-float  t1R         = input.float(1.0, "Target 1 (R)", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
-float  t2R         = input.float(2.0, "T2", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
-float  t3R         = input.float(3.0, "T3", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
-bool   beAfterT1   = input.bool(false, "Move stop to break-even after T1", group = G_RISK)
+string slMethod    = input.string(SL_SWEEP, "Stop-Loss Method", options = [SL_SWEEP, SL_SWING, SL_ATR], group = G_RISK, display = display.none)
+int    atrLen      = input.int(14, "ATR Length", minval = 1, group = G_RISK, display = display.none)
+float  slAtrMult   = input.float(1.5, "ATR Stop Multiple", minval = 0.1, step = 0.1, group = G_RISK, display = display.none)
+float  slBufferAtr = input.float(0.05, "Stop Buffer (× ATR)", minval = 0.0, step = 0.01, group = G_RISK, display = display.none, tooltip = "Extra distance beyond the sweep extreme / swing. Not applied to ATR-based stops.")
+float  maxRiskAtr  = input.float(0.0, "Max Risk (× ATR, 0 = off)", minval = 0.0, step = 0.5, group = G_RISK, display = display.none)
+float  t1R         = input.float(1.0, "Target 1 (R)", minval = 0.1, step = 0.5, group = G_RISK, display = display.none, inline = "tr")
+float  t2R         = input.float(2.0, "T2", minval = 0.1, step = 0.5, group = G_RISK, display = display.none, inline = "tr")
+float  t3R         = input.float(3.0, "T3", minval = 0.1, step = 0.5, group = G_RISK, display = display.none, inline = "tr")
+bool   beAfterT1   = input.bool(false, "Move stop to break-even after T1", group = G_RISK, display = display.none)
 
 // ---------- Global calculations (executed on every bar, unconditionally) ----------
 float atrVal = ta.atr(atrLen)
@@ -196,6 +196,7 @@ type Setup
     float mssLevel    = na      // confirmed swing used for the MSS
     int   mssPivotBar = na
     int   mssBar      = na
+    bool  confirmedOnce = false  // first sweep confirmation of this setup already reported
 
 // ---------- Methods & helpers ----------
 method isTradable(CRTRange r) =>
@@ -224,6 +225,7 @@ method reset(Setup s) =>
     s.mssLevel    := na
     s.mssPivotBar := na
     s.mssBar      := na
+    s.confirmedOnce := false
     s
 
 var array<float> phVals = array.new<float>()
@@ -360,7 +362,9 @@ processSetup(Setup s, CRTRange r, bool canEnter, bool tradeOpen) =>
         if confirmOk
             s.state      := ST_CONFIRMED
             s.confirmBar := bar_index
-            evConfirm    := true
+            // Report only the first confirmation of a setup (a re-reclaim after slipping back is not a new sweep)
+            evConfirm       := not s.confirmedOnce
+            s.confirmedOnce := true
             // MSS reference: most recent CONFIRMED swing beyond the current close
             [lvlA, barA] = findLevel(d == 1 ? phVals : plVals, d == 1 ? phBars : plBars, d, close)
             s.mssLevel    := lvlA
@@ -477,32 +481,32 @@ const string SZ_FIXED  = "Fixed Quantity"
 const string SZ_EQUITY = "% of Equity"
 const string SZ_RISK   = "Risk % of Equity"
 
-string dirMode    = input.string(DM_BOTH, "Trade Direction", options = [DM_BOTH, DM_LONG, DM_SHORT], group = G_STRAT)
-string sizingMode = input.string(SZ_RISK, "Position Sizing", options = [SZ_FIXED, SZ_EQUITY, SZ_RISK], group = G_STRAT,
+string dirMode    = input.string(DM_BOTH, "Trade Direction", options = [DM_BOTH, DM_LONG, DM_SHORT], group = G_STRAT, display = display.none)
+string sizingMode = input.string(SZ_RISK, "Position Sizing", options = [SZ_FIXED, SZ_EQUITY, SZ_RISK], group = G_STRAT, display = display.none,
       tooltip = "Fixed: constant quantity.\n% of Equity: position value = X% of current equity.\nRisk % of Equity: quantity sized so that a stop-loss hit loses ≈ X% of equity (before slippage/commission/gaps).")
-float fixedQty    = input.float(1.0, "Fixed Quantity", minval = 0.0, group = G_STRAT)
-float equityPct   = input.float(10.0, "% of Equity per trade", minval = 0.01, maxval = 1000.0, group = G_STRAT)
-float riskPct     = input.float(1.0, "Risk % of Equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = G_STRAT)
-float maxPosPct   = input.float(100.0, "Max position value (% of equity)", minval = 1.0, maxval = 10000.0, group = G_STRAT, tooltip = "Caps Risk-% sizing when the stop is very tight. Increase only if you deliberately use leverage.")
-float qtyStep     = input.float(1.0, "Quantity step / lot size", minval = 0.00000001, group = G_STRAT, tooltip = "1 for shares; the contract lot size for F&O; e.g. 0.001 for crypto. Quantities are rounded DOWN to this step.")
+float fixedQty    = input.float(1.0, "Fixed Quantity", minval = 0.0, group = G_STRAT, display = display.none)
+float equityPct   = input.float(10.0, "% of Equity per trade", minval = 0.01, maxval = 1000.0, group = G_STRAT, display = display.none)
+float riskPct     = input.float(1.0, "Risk % of Equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = G_STRAT, display = display.none)
+float maxPosPct   = input.float(100.0, "Max position value (% of equity)", minval = 1.0, maxval = 10000.0, group = G_STRAT, display = display.none, tooltip = "Caps Risk-% sizing when the stop is very tight. Increase only if you deliberately use leverage.")
+float qtyStep     = input.float(1.0, "Quantity step / lot size", minval = 0.00000001, group = G_STRAT, display = display.none, tooltip = "1 for shares; the contract lot size for F&O; e.g. 0.001 for crypto. Quantities are rounded DOWN to this step.")
 
-bool   usePartials    = input.bool(true, "Partial exits at T1 / T2 / T3", group = G_EXIT)
-float  pctT1          = input.float(33.0, "% closed at T1", minval = 0.0, maxval = 99.0, group = G_EXIT, inline = "pp")
-float  pctT2          = input.float(33.0, "% at T2 (rest at T3)", minval = 0.0, maxval = 99.0, group = G_EXIT, inline = "pp")
-string fullTarget     = input.string("T2", "Single target (when partials off)", options = ["T1", "T2", "T3"], group = G_EXIT)
-bool   recalcFromFill = input.bool(true, "Recalculate targets from actual fill price", group = G_EXIT,
+bool   usePartials    = input.bool(true, "Partial exits at T1 / T2 / T3", group = G_EXIT, display = display.none)
+float  pctT1          = input.float(33.0, "% closed at T1", minval = 0.0, maxval = 99.0, group = G_EXIT, display = display.none, inline = "pp")
+float  pctT2          = input.float(33.0, "% at T2 (rest at T3)", minval = 0.0, maxval = 99.0, group = G_EXIT, display = display.none, inline = "pp")
+string fullTarget     = input.string("T2", "Single target (when partials off)", options = ["T1", "T2", "T3"], group = G_EXIT, display = display.none)
+bool   recalcFromFill = input.bool(true, "Recalculate targets from actual fill price", group = G_EXIT, display = display.none,
       tooltip = "The signal uses the signal-bar close; the order fills at the next open. When enabled, targets are re-based on the real fill price (risk = |fill − stop|) once the position exists. The stop price is never moved by this.")
 
-bool useDateFilter = input.bool(false, "Use date range", group = G_DATE)
-int  startDate     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Start", group = G_DATE)
-int  endDate       = input.time(timestamp("31 Dec 2099 23:59 +0000"), "End", group = G_DATE)
-bool closeAtEnd    = input.bool(true, "Close open position after End date", group = G_DATE)
+bool useDateFilter = input.bool(false, "Use date range", group = G_DATE, display = display.none)
+int  startDate     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Start", group = G_DATE, display = display.none)
+int  endDate       = input.time(timestamp("31 Dec 2099 23:59 +0000"), "End", group = G_DATE, display = display.none)
+bool closeAtEnd    = input.bool(true, "Close open position after End date", group = G_DATE, display = display.none)
 
-bool  showLevels       = input.bool(true, "Plot position Entry / SL / Targets", group = G_SVIS)
-bool  showMarkers      = input.bool(true, "Sweep / MSS / signal markers", group = G_SVIS)
-bool  useDynamicAlerts = input.bool(true, "Dynamic alert() on signals", group = G_SVIS)
-color colBull          = input.color(#26a69a, "Bullish", group = G_SVIS, inline = "sc")
-color colBear          = input.color(#ef5350, "Bearish", group = G_SVIS, inline = "sc")
+bool  showLevels       = input.bool(true, "Plot position Entry / SL / Targets", group = G_SVIS, display = display.none)
+bool  showMarkers      = input.bool(true, "Sweep / MSS / signal markers", group = G_SVIS, display = display.none)
+bool  useDynamicAlerts = input.bool(true, "Dynamic alert() on signals", group = G_SVIS, display = display.none)
+color colBull          = input.color(#26a69a, "Bullish", group = G_SVIS, display = display.none, inline = "sc")
+color colBear          = input.color(#ef5350, "Bearish", group = G_SVIS, display = display.none, inline = "sc")
 
 if usePartials and pctT1 + pctT2 >= 100.0
     runtime.error("CRT Strategy: '% closed at T1' + '% at T2' must be below 100 so that a remainder exits at T3.")
