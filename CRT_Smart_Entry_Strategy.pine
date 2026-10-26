@@ -1,0 +1,687 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+strategy("CRT Smart Entry Strategy", shorttitle = "CRT SES", overlay = true,
+      initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0,
+      commission_type = strategy.commission.percent, commission_value = 0.03, slippage = 2,
+      process_orders_on_close = false, calc_on_every_tick = false, calc_on_order_fills = false,
+      fill_orders_on_standard_ohlc = true, margin_long = 100, margin_short = 100,
+      max_lines_count = 50, max_labels_count = 50)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CRT Smart Entry Strategy — backtesting companion of CRT Smart Entry Pro.
+//
+// The signal rules are the CORE section below, byte-identical to the indicator.
+//
+// Fill model (TradingView broker emulator):
+//   • Signals are evaluated at bar close. Market entries fill at the NEXT bar's open
+//     (process_orders_on_close = false), plus the configured slippage.
+//   • Stop / limit exits are simulated from OHLC only. Inside one bar the emulator
+//     assumes a price path (open → nearer of high/low → the other); the real
+//     intrabar sequence is unknown. Bar Magnifier (Premium) reduces this error.
+//   • Gaps through the stop fill at the open (worse than the stop price).
+//   • Commission and slippage defaults are placeholders — set them for your market
+//     in Settings → Properties.
+// Past backtest results do not guarantee future performance.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ============================ CORE START ============================
+// The section between CORE START / CORE END is kept byte-identical in
+// CRT_Smart_Entry_Pro.pine and CRT_Smart_Entry_Strategy.pine
+// (verified by tools/check_core_sync.py).
+
+// ---------- Constants ----------
+const string RM_PREV   = "Previous Candle"
+const string RM_HTF    = "Higher Timeframe Candle"
+const string RM_OR     = "Session Opening Range"
+const string RM_FIRST  = "First Session Candle (5m/15m)"
+const string RM_CUSTOM = "Custom Session"
+
+const string SS_AUTO   = "Symbol Session (auto)"
+const string SS_MANUAL = "Manual Session"
+
+const string SW_WICK   = "Wick (high/low)"
+const string SW_CLOSE  = "Close Beyond"
+
+const string CF_CLOSE  = "Close Back Inside"
+const string CF_REJECT = "Rejection Candle"
+
+const string MD_NONE   = "None"
+const string MD_TICKS  = "Ticks"
+const string MD_ATR    = "ATR Multiple"
+const string MD_PCT    = "% of Range"
+
+const string BRK_CLOSE = "Close"
+const string BRK_WICK  = "Wick"
+
+const string EM_CONFIRM = "Confirmation (MSS close)"
+const string EM_RETEST  = "Retest of MSS level"
+
+const string SL_SWEEP  = "Beyond Sweep Extreme"
+const string SL_SWING  = "Beyond Structure Swing"
+const string SL_ATR    = "ATR Based"
+
+const int ST_IDLE      = 0
+const int ST_SWEPT     = 1
+const int ST_CONFIRMED = 2
+const int ST_MSS       = 3
+
+const int MAX_PIVOTS   = 50
+
+const string G_RANGE = "1 · CRT Range"
+const string G_SESS  = "1b · Sessions & Timezone"
+const string G_SWEEP = "2 · Liquidity Sweep"
+const string G_MSS   = "3 · Market Structure Shift"
+const string G_ENTRY = "4 · Entry"
+const string G_RISK  = "5 · Stop Loss & Targets"
+
+// ---------- Inputs: range ----------
+string rangeMode       = input.string(RM_HTF, "Range Source", options = [RM_PREV, RM_HTF, RM_OR, RM_FIRST, RM_CUSTOM], group = G_RANGE,
+      tooltip = "Previous Candle: the last closed chart candle.\nHigher Timeframe Candle: the last CLOSED candle of the selected HTF.\nSession Opening Range: first N minutes of the trading session.\nFirst Session Candle: first 5m or 15m of the session.\nCustom Session: high/low of a user-defined time window (e.g. Asia session).")
+string htfInput        = input.timeframe("60", "Higher Timeframe", group = G_RANGE, tooltip = "Used only by 'Higher Timeframe Candle'. Must be greater than the chart timeframe.")
+int    orMinutes       = input.int(15, "Opening Range Duration (minutes)", minval = 1, group = G_RANGE, tooltip = "Used only by 'Session Opening Range'. Chart timeframe should be ≤ this value for an exact range.")
+string firstCandleSize = input.string("15", "First Candle Size (minutes)", options = ["5", "15"], group = G_RANGE, tooltip = "Used only by 'First Session Candle'. Chart timeframe should be ≤ this value.")
+bool   resetOnNewRange = input.bool(true, "Reset pending setups when a new range starts", group = G_RANGE, tooltip = "Ignored in 'Previous Candle' mode (a new range starts every bar there; pending setups keep their own snapshot of the swept level and expire by their timeouts).")
+int    maxSignalsPerRange = input.int(1, "Max signals per range (per direction)", minval = 1, maxval = 20, group = G_RANGE)
+
+// ---------- Inputs: sessions ----------
+string sessSource = input.string(SS_AUTO, "Session Start Source", options = [SS_AUTO, SS_MANUAL], group = G_SESS,
+      tooltip = "Symbol Session (auto): uses the symbol's own regular session from TradingView (first regular bar of each session).\nManual Session: uses the session string below in the selected timezone.")
+string sessInput  = input.session("0000-0000", "Manual Trading Session", group = G_SESS, tooltip = "Used when Session Start Source = Manual. '0000-0000' = 24h session (starts each new day in the selected timezone).")
+string customSess = input.session("0000-0600", "Custom Range Session", group = G_SESS, tooltip = "Used only by 'Custom Session' range source. Range locks when this window ends.")
+string tzInput    = input.string("Exchange", "Timezone", group = G_SESS, tooltip = "'Exchange' = the symbol's exchange timezone. Otherwise an IANA name (e.g. 'Asia/Kolkata', 'America/New_York', 'UTC') or 'GMT+5:30'.")
+bool   useSignalSess = input.bool(false, "Only allow entries inside a signal session", group = G_SESS)
+string signalSess = input.session("0000-0000", "Signal Session", group = G_SESS)
+
+// ---------- Inputs: sweep ----------
+string sweepType      = input.string(SW_WICK, "Sweep Detection", options = [SW_WICK, SW_CLOSE], group = G_SWEEP,
+      tooltip = "Wick: a high/low beyond the range boundary counts as a sweep.\nClose Beyond: the candle must also CLOSE beyond the boundary (reclaim must then happen on a later bar).")
+string confirmMode    = input.string(CF_CLOSE, "Sweep Confirmation", options = [CF_CLOSE, CF_REJECT], group = G_SWEEP,
+      tooltip = "Close Back Inside: a close back inside the range.\nRejection Candle: close back inside + candle body in the trade direction + rejection wick ≥ the % below.")
+int    maxReclaimBars = input.int(3, "Max bars to confirm (reclaim)", minval = 0, maxval = 50, group = G_SWEEP, tooltip = "0 = the reclaim must happen on the sweep candle itself.")
+string minSweepMode   = input.string(MD_NONE, "Minimum Sweep Distance", options = [MD_NONE, MD_TICKS, MD_ATR, MD_PCT], group = G_SWEEP, inline = "msd")
+float  minSweepValue  = input.float(0.0, "", minval = 0.0, step = 0.05, group = G_SWEEP, inline = "msd")
+float  rejWickPct     = input.float(40.0, "Rejection wick ≥ % of candle", minval = 0.0, maxval = 100.0, group = G_SWEEP)
+
+// ---------- Inputs: MSS ----------
+int    pivotLeft    = input.int(3, "Pivot Left Bars", minval = 1, maxval = 50, group = G_MSS)
+int    pivotRight   = input.int(2, "Pivot Right Bars (confirmation delay)", minval = 1, maxval = 50, group = G_MSS,
+      tooltip = "A swing is confirmed only after this many bars have closed to its right. This delay is intentional and prevents repainting pivots.")
+string mssBreakType = input.string(BRK_CLOSE, "MSS Break Type", options = [BRK_CLOSE, BRK_WICK], group = G_MSS)
+int    maxBarsToMss = input.int(20, "Max bars from sweep confirmation to MSS", minval = 1, maxval = 500, group = G_MSS)
+int    swingMaxAge  = input.int(100, "Max swing age (bars)", minval = 5, maxval = 1000, group = G_MSS, tooltip = "Only swings formed within this many bars are used as MSS / structure-stop references.")
+
+// ---------- Inputs: entry ----------
+string entryMode     = input.string(EM_CONFIRM, "Entry Mode", options = [EM_CONFIRM, EM_RETEST], group = G_ENTRY)
+float  retestTolAtr  = input.float(0.10, "Retest tolerance (× ATR)", minval = 0.0, step = 0.05, group = G_ENTRY)
+int    maxRetestBars = input.int(10, "Max bars to wait for retest", minval = 1, maxval = 200, group = G_ENTRY)
+
+// ---------- Inputs: risk ----------
+string slMethod    = input.string(SL_SWEEP, "Stop-Loss Method", options = [SL_SWEEP, SL_SWING, SL_ATR], group = G_RISK)
+int    atrLen      = input.int(14, "ATR Length", minval = 1, group = G_RISK)
+float  slAtrMult   = input.float(1.5, "ATR Stop Multiple", minval = 0.1, step = 0.1, group = G_RISK)
+float  slBufferAtr = input.float(0.05, "Stop Buffer (× ATR)", minval = 0.0, step = 0.01, group = G_RISK, tooltip = "Extra distance beyond the sweep extreme / swing. Not applied to ATR-based stops.")
+float  maxRiskAtr  = input.float(0.0, "Max Risk (× ATR, 0 = off)", minval = 0.0, step = 0.5, group = G_RISK)
+float  t1R         = input.float(1.0, "Target 1 (R)", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+float  t2R         = input.float(2.0, "T2", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+float  t3R         = input.float(3.0, "T3", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+bool   beAfterT1   = input.bool(false, "Move stop to break-even after T1", group = G_RISK)
+
+// ---------- Global calculations (executed on every bar, unconditionally) ----------
+float atrVal = ta.atr(atrLen)
+float ph     = ta.pivothigh(high, pivotLeft, pivotRight)
+float pl     = ta.pivotlow(low, pivotLeft, pivotRight)
+
+string tzEff = tzInput == "Exchange" or tzInput == "" ? syminfo.timezone : tzInput
+
+// Higher timeframe: previous CLOSED HTF candle only ([1] + lookahead_on = no future data, no repaint).
+// Every requested expression is offset by [1]; the previous HTF bar's open time changes exactly
+// when a new HTF bar starts, which is how a new range is detected.
+bool   htfValid = timeframe.in_seconds(htfInput) > timeframe.in_seconds(timeframe.period)
+string htfEff   = htfValid ? htfInput : timeframe.period
+[htfHi, htfLo, htfPrevTime] = request.security(syminfo.tickerid, htfEff, [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+bool htfNewBar = bar_index > 0 and not na(htfPrevTime) and htfPrevTime != htfPrevTime[1]
+if rangeMode == RM_HTF and not htfValid
+    runtime.error("CRT: 'Higher Timeframe' (" + htfInput + ") must be greater than the chart timeframe (" + timeframe.period + ").")
+
+// Session start detection (auto = symbol's regular session; manual = session string + timezone)
+bool inManualSess    = not na(time(timeframe.period, sessInput, tzEff))
+int  dayKey          = dayofmonth(time, tzEff)
+bool newDayTz        = bar_index > 0 and dayKey != dayKey[1]
+bool sessAllDay      = str.startswith(sessInput, "0000-0000")
+bool manualSessStart = inManualSess and (not inManualSess[1] or (sessAllDay and newDayTz))
+bool sessionStart    = sessSource == SS_AUTO ? session.isfirstbar_regular : manualSessStart
+
+// Opening-range / first-candle window
+int orMinutesEff = rangeMode == RM_FIRST ? (firstCandleSize == "15" ? 15 : 5) : orMinutes
+var int orStartTime = na
+if sessionStart
+    orStartTime := time
+bool orWindowActive = not na(orStartTime) and time >= orStartTime and time < orStartTime + orMinutesEff * 60000
+
+// Custom session window
+bool customActive = not na(time(timeframe.period, customSess, tzEff))
+
+bool isOrMode      = rangeMode == RM_OR or rangeMode == RM_FIRST
+bool isWindowMode  = isOrMode or rangeMode == RM_CUSTOM
+bool windowActive  = rangeMode == RM_CUSTOM ? customActive : isOrMode ? orWindowActive : false
+bool windowStart   = rangeMode == RM_CUSTOM ? (customActive and not customActive[1]) : isOrMode ? sessionStart : false
+bool windowEnd     = windowActive[1] and not windowActive
+
+// A new reference range begins on this bar (time-based, known at bar open)
+bool newRangeEvt = rangeMode == RM_PREV ? bar_index > 0 : rangeMode == RM_HTF ? htfNewBar : windowStart
+
+bool signalSessionOk = not useSignalSess or not na(time(timeframe.period, signalSess, tzEff))
+
+// ---------- Types ----------
+type CRTRange
+    float hi          = na
+    float lo          = na
+    float mid         = na
+    int   startBar    = na
+    bool  locked      = false   // true once the range is complete and tradable
+    int   id          = 0
+    bool  lowSwept    = false
+    bool  highSwept   = false
+    int   bullSignals = 0
+    int   bearSignals = 0
+
+type Setup
+    int   dir         = 0       // +1 bullish, -1 bearish
+    int   state       = 0       // ST_IDLE / ST_SWEPT / ST_CONFIRMED / ST_MSS
+    int   rangeId     = 0
+    float level       = na      // swept range boundary (range low for bull, range high for bear)
+    float extreme     = na      // sweep extreme (lowest low / highest high since the sweep)
+    int   sweepBar    = na
+    int   confirmBar  = na
+    float mssLevel    = na      // confirmed swing used for the MSS
+    int   mssPivotBar = na
+    int   mssBar      = na
+
+// ---------- Methods & helpers ----------
+method isTradable(CRTRange r) =>
+    r.locked and not na(r.hi) and not na(r.lo) and r.hi > r.lo
+
+method startRange(CRTRange r, float hi, float lo, int startBar, bool locked) =>
+    r.id          := r.id + 1
+    r.hi          := hi
+    r.lo          := lo
+    r.mid         := (hi + lo) / 2.0
+    r.startBar    := startBar
+    r.locked      := locked
+    r.lowSwept    := false
+    r.highSwept   := false
+    r.bullSignals := 0
+    r.bearSignals := 0
+    r
+
+method reset(Setup s) =>
+    s.state       := ST_IDLE
+    s.rangeId     := 0
+    s.level       := na
+    s.extreme     := na
+    s.sweepBar    := na
+    s.confirmBar  := na
+    s.mssLevel    := na
+    s.mssPivotBar := na
+    s.mssBar      := na
+    s
+
+var array<float> phVals = array.new<float>()
+var array<int>   phBars = array.new<int>()
+var array<float> plVals = array.new<float>()
+var array<int>   plBars = array.new<int>()
+
+// Store newly CONFIRMED pivots (pivot bar = bar_index - pivotRight). Call on confirmed bars only.
+updatePivots() =>
+    if not na(ph)
+        phVals.push(ph)
+        phBars.push(bar_index - pivotRight)
+        if phVals.size() > MAX_PIVOTS
+            phVals.shift()
+            phBars.shift()
+    if not na(pl)
+        plVals.push(pl)
+        plBars.push(bar_index - pivotRight)
+        if plVals.size() > MAX_PIVOTS
+            plVals.shift()
+            plBars.shift()
+    true
+
+// Most recent confirmed pivot on the requested side of `ref` (side = +1 above, -1 below), within swingMaxAge.
+findLevel(array<float> vals, array<int> bars, int side, float ref) =>
+    float lvl  = na
+    int   pBar = na
+    int   n    = vals.size()
+    if n > 0 and not na(ref)
+        for i = n - 1 to 0
+            int b = bars.get(i)
+            if bar_index - b > swingMaxAge
+                break
+            float v = vals.get(i)
+            if side * (v - ref) > 0
+                lvl  := v
+                pBar := b
+                break
+    [lvl, pBar]
+
+minSweepDistance(float rangeSize) =>
+    switch minSweepMode
+        MD_TICKS => minSweepValue * syminfo.mintick
+        MD_ATR   => minSweepValue * nz(atrVal)
+        MD_PCT   => minSweepValue / 100.0 * rangeSize
+        => 0.0
+
+rejectionOk(int d) =>
+    float barRange = high - low
+    float wick     = d == 1 ? math.min(open, close) - low : high - math.max(open, close)
+    barRange > 0 and d * (close - open) > 0 and wick / barRange * 100.0 >= rejWickPct
+
+// Stop-loss price for direction d. Returns na if it cannot be computed.
+calcStop(int d, float entry, float extreme) =>
+    float buf  = nz(atrVal) * slBufferAtr
+    float base = na
+    if slMethod == SL_ATR
+        base := na(atrVal) ? na : entry - d * atrVal * slAtrMult
+        buf  := 0.0
+    else if slMethod == SL_SWING
+        [swLvl, swBar] = findLevel(d == 1 ? plVals : phVals, d == 1 ? plBars : phBars, -d, entry)
+        base := na(swLvl) ? extreme : swLvl
+    else
+        base := extreme
+    na(base) ? na : math.round_to_mintick(base - d * buf)
+
+// Range builder. Call on confirmed bars only. Returns [newRangeStarted, rangeLockedNow].
+updateRange(CRTRange r) =>
+    bool started   = false
+    bool lockedNow = false
+    if rangeMode == RM_PREV
+        if bar_index > 0 and high[1] > low[1]
+            r.startRange(high[1], low[1], bar_index - 1, true)
+            started   := true
+            lockedNow := true
+    else if rangeMode == RM_HTF
+        if htfNewBar and not na(htfHi) and not na(htfLo) and htfHi > htfLo
+            r.startRange(htfHi, htfLo, bar_index, true)
+            started   := true
+            lockedNow := true
+    else
+        if windowStart
+            r.startRange(high, low, bar_index, false)
+            started := true
+        else if windowActive and not r.locked and not na(r.hi)
+            r.hi  := math.max(r.hi, high)
+            r.lo  := math.min(r.lo, low)
+            r.mid := (r.hi + r.lo) / 2.0
+        if windowEnd and not r.locked and not na(r.hi) and r.hi > r.lo
+            r.locked  := true
+            lockedNow := true
+    [started, lockedNow]
+
+// Core CRT state machine for one direction. Call on confirmed bars only.
+// canEnter: external entry filters (session/date/direction). tradeOpen: a trade is already running.
+// Returns [evSweep, evConfirm, evMss, evEntry, evInvalid, entryPx, slPx, mssLvl, mssPivotBar, note]
+processSetup(Setup s, CRTRange r, bool canEnter, bool tradeOpen) =>
+    int    d         = s.dir
+    bool   evSweep   = false
+    bool   evConfirm = false
+    bool   evMss     = false
+    bool   evEntry   = false
+    bool   evInvalid = false
+    float  entryPx   = na
+    float  slPx      = na
+    float  mssLvl    = na
+    int    mssPivot  = na
+    string note      = ""
+    float  adverse   = d == 1 ? low : high
+
+    // IDLE → SWEPT: price trades beyond the locked range boundary
+    if s.state == ST_IDLE and r.isTradable() and not na(atrVal)
+        int   used    = d == 1 ? r.bullSignals : r.bearSignals
+        float level   = d == 1 ? r.lo : r.hi
+        float pierce  = d * (level - adverse)
+        bool  closeOk = sweepType == SW_WICK or d * (level - close) > 0
+        if used < maxSignalsPerRange and pierce > 0 and pierce >= minSweepDistance(r.hi - r.lo) and closeOk
+            s.state    := ST_SWEPT
+            s.rangeId  := r.id
+            s.level    := level
+            s.extreme  := adverse
+            s.sweepBar := bar_index
+            evSweep    := true
+            if d == 1
+                r.lowSwept := true
+            else
+                r.highSwept := true
+
+    // SWEPT → CONFIRMED: close back inside the range (optionally with a rejection candle)
+    if s.state == ST_SWEPT
+        s.extreme := d == 1 ? math.min(s.extreme, low) : math.max(s.extreme, high)
+        bool backInside = d * (close - s.level) > 0
+        bool confirmOk  = confirmMode == CF_CLOSE ? backInside : backInside and rejectionOk(d)
+        if confirmOk
+            s.state      := ST_CONFIRMED
+            s.confirmBar := bar_index
+            evConfirm    := true
+            // MSS reference: most recent CONFIRMED swing beyond the current close
+            [lvlA, barA] = findLevel(d == 1 ? phVals : plVals, d == 1 ? phBars : plBars, d, close)
+            s.mssLevel    := lvlA
+            s.mssPivotBar := barA
+        else if bar_index - s.sweepBar >= maxReclaimBars
+            evInvalid := true
+            note      := "no reclaim within " + str.tostring(maxReclaimBars) + " bar(s)"
+            s.reset()
+
+    // CONFIRMED → MSS: break of a previously confirmed swing (next bar onward)
+    if s.state == ST_CONFIRMED and bar_index > s.confirmBar
+        s.extreme := d == 1 ? math.min(s.extreme, low) : math.max(s.extreme, high)
+        if d * (close - s.level) <= 0
+            // Closed back beyond the swept level: sweep still in progress, wait for a new reclaim
+            s.state       := ST_SWEPT
+            s.sweepBar    := bar_index
+            s.mssLevel    := na
+            s.mssPivotBar := na
+        else
+            if na(s.mssLevel)
+                [lvlB, barB] = findLevel(d == 1 ? phVals : plVals, d == 1 ? phBars : plBars, d, close)
+                s.mssLevel    := lvlB
+                s.mssPivotBar := barB
+            float brkPx = mssBreakType == BRK_CLOSE ? close : (d == 1 ? high : low)
+            if not na(s.mssLevel) and d * (brkPx - s.mssLevel) > 0
+                s.state  := ST_MSS
+                s.mssBar := bar_index
+                evMss    := true
+                mssLvl   := s.mssLevel
+                mssPivot := s.mssPivotBar
+            else if bar_index - s.confirmBar >= maxBarsToMss
+                evInvalid := true
+                note      := "no MSS within " + str.tostring(maxBarsToMss) + " bars"
+                s.reset()
+
+    // MSS → ENTRY
+    bool wantEntry = false
+    if s.state == ST_MSS
+        if entryMode == EM_CONFIRM
+            wantEntry := true
+        else if bar_index > s.mssBar
+            float tol      = nz(atrVal) * retestTolAtr
+            bool  touched  = d == 1 ? low <= s.mssLevel + tol : high >= s.mssLevel - tol
+            bool  rejected = d * (close - s.mssLevel) > 0 and d * (close - open) > 0
+            if d * (close - s.extreme) <= 0
+                evInvalid := true
+                note      := "closed beyond sweep extreme before retest"
+                s.reset()
+            else if touched and rejected
+                wantEntry := true
+            else if bar_index - s.mssBar >= maxRetestBars
+                evInvalid := true
+                note      := "no retest within " + str.tostring(maxRetestBars) + " bars"
+                s.reset()
+
+    if wantEntry
+        float ePx  = close
+        float sPx  = calcStop(d, ePx, s.extreme)
+        float risk = na(sPx) ? na : d * (ePx - sPx)
+        if na(risk) or na(atrVal)
+            note := "stop unavailable"
+        else if risk <= syminfo.mintick * 0.5
+            note := "invalid risk (stop on wrong side of entry or zero)"
+        else if maxRiskAtr > 0 and risk > maxRiskAtr * atrVal
+            note := "risk exceeds " + str.tostring(maxRiskAtr) + " × ATR"
+        else if not canEnter
+            note := "entry blocked by session/date/direction filter"
+        else if tradeOpen
+            note := "skipped: a trade is already active"
+        if note == ""
+            evEntry := true
+            entryPx := ePx
+            slPx    := sPx
+            if d == 1
+                r.bullSignals := r.bullSignals + 1
+            else
+                r.bearSignals := r.bearSignals + 1
+        else
+            evInvalid := true
+        s.reset()
+
+    [evSweep, evConfirm, evMss, evEntry, evInvalid, entryPx, slPx, mssLvl, mssPivot, note]
+
+setupText(Setup s) =>
+    switch s.state
+        ST_SWEPT     => "Swept · awaiting reclaim"
+        ST_CONFIRMED => "Sweep confirmed · awaiting MSS"
+        ST_MSS       => "MSS · awaiting retest"
+        => "Idle"
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// ---------- Persistent state ----------
+var CRTRange rng       = CRTRange.new()
+var Setup    bullSetup = Setup.new(dir = 1)
+var Setup    bearSetup = Setup.new(dir = -1)
+// ============================ CORE END ==============================
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STRATEGY-ONLY SECTION: sizing, orders, exits, filters
+// ═════════════════════════════════════════════════════════════════════════════
+
+const string G_STRAT = "9 · Strategy: Orders & Sizing"
+const string G_EXIT  = "9b · Strategy: Exits"
+const string G_DATE  = "9c · Strategy: Date Range"
+const string G_SVIS  = "9d · Strategy: Visuals & Alerts"
+
+const string DM_BOTH  = "Long & Short"
+const string DM_LONG  = "Long Only"
+const string DM_SHORT = "Short Only"
+
+const string SZ_FIXED  = "Fixed Quantity"
+const string SZ_EQUITY = "% of Equity"
+const string SZ_RISK   = "Risk % of Equity"
+
+string dirMode    = input.string(DM_BOTH, "Trade Direction", options = [DM_BOTH, DM_LONG, DM_SHORT], group = G_STRAT)
+string sizingMode = input.string(SZ_RISK, "Position Sizing", options = [SZ_FIXED, SZ_EQUITY, SZ_RISK], group = G_STRAT,
+      tooltip = "Fixed: constant quantity.\n% of Equity: position value = X% of current equity.\nRisk % of Equity: quantity sized so that a stop-loss hit loses ≈ X% of equity (before slippage/commission/gaps).")
+float fixedQty    = input.float(1.0, "Fixed Quantity", minval = 0.0, group = G_STRAT)
+float equityPct   = input.float(10.0, "% of Equity per trade", minval = 0.01, maxval = 1000.0, group = G_STRAT)
+float riskPct     = input.float(1.0, "Risk % of Equity per trade", minval = 0.01, maxval = 100.0, step = 0.1, group = G_STRAT)
+float maxPosPct   = input.float(100.0, "Max position value (% of equity)", minval = 1.0, maxval = 10000.0, group = G_STRAT, tooltip = "Caps Risk-% sizing when the stop is very tight. Increase only if you deliberately use leverage.")
+float qtyStep     = input.float(1.0, "Quantity step / lot size", minval = 0.00000001, group = G_STRAT, tooltip = "1 for shares; the contract lot size for F&O; e.g. 0.001 for crypto. Quantities are rounded DOWN to this step.")
+
+bool   usePartials    = input.bool(true, "Partial exits at T1 / T2 / T3", group = G_EXIT)
+float  pctT1          = input.float(33.0, "% closed at T1", minval = 0.0, maxval = 99.0, group = G_EXIT, inline = "pp")
+float  pctT2          = input.float(33.0, "% at T2 (rest at T3)", minval = 0.0, maxval = 99.0, group = G_EXIT, inline = "pp")
+string fullTarget     = input.string("T2", "Single target (when partials off)", options = ["T1", "T2", "T3"], group = G_EXIT)
+bool   recalcFromFill = input.bool(true, "Recalculate targets from actual fill price", group = G_EXIT,
+      tooltip = "The signal uses the signal-bar close; the order fills at the next open. When enabled, targets are re-based on the real fill price (risk = |fill − stop|) once the position exists. The stop price is never moved by this.")
+
+bool useDateFilter = input.bool(false, "Use date range", group = G_DATE)
+int  startDate     = input.time(timestamp("01 Jan 2020 00:00 +0000"), "Start", group = G_DATE)
+int  endDate       = input.time(timestamp("31 Dec 2099 23:59 +0000"), "End", group = G_DATE)
+bool closeAtEnd    = input.bool(true, "Close open position after End date", group = G_DATE)
+
+bool  showLevels       = input.bool(true, "Plot position Entry / SL / Targets", group = G_SVIS)
+bool  showMarkers      = input.bool(true, "Sweep / MSS / signal markers", group = G_SVIS)
+bool  useDynamicAlerts = input.bool(true, "Dynamic alert() on signals", group = G_SVIS)
+color colBull          = input.color(#26a69a, "Bullish", group = G_SVIS, inline = "sc")
+color colBear          = input.color(#ef5350, "Bearish", group = G_SVIS, inline = "sc")
+
+if usePartials and pctT1 + pctT2 >= 100.0
+    runtime.error("CRT Strategy: '% closed at T1' + '% at T2' must be below 100 so that a remainder exits at T3.")
+
+// ---------- Helpers ----------
+roundQty(float q) =>
+    na(q) or q <= 0 ? 0.0 : math.floor(q / qtyStep + 1e-9) * qtyStep
+
+calcQty(float entry, float sl) =>
+    float unitValue = entry * syminfo.pointvalue
+    float raw = na
+    if sizingMode == SZ_FIXED
+        raw := fixedQty
+    else if sizingMode == SZ_EQUITY
+        raw := unitValue > 0 ? strategy.equity * equityPct / 100.0 / unitValue : na
+    else
+        float riskPerUnit = math.abs(entry - sl) * syminfo.pointvalue
+        raw := riskPerUnit > 0 ? strategy.equity * riskPct / 100.0 / riskPerUnit : na
+        if not na(raw) and unitValue > 0
+            raw := math.min(raw, strategy.equity * maxPosPct / 100.0 / unitValue)
+    roundQty(raw)
+
+// Place / modify the exit orders of the open (or pending) entry. Quantities are absolute.
+issueExits(string eid, float sl, float t1, float t2, float t3, float q1, float q2, float q3, bool withT1, bool withT2) =>
+    if usePartials
+        if withT1 and q1 > 0
+            strategy.exit(eid + " T1", eid, qty = q1, stop = sl, limit = t1, comment_profit = "T1", comment_loss = "SL")
+        if withT2 and q2 > 0
+            strategy.exit(eid + " T2", eid, qty = q2, stop = sl, limit = t2, comment_profit = "T2", comment_loss = "SL")
+        if q3 > 0
+            strategy.exit(eid + " T3", eid, qty = q3, stop = sl, limit = t3, comment_profit = "T3", comment_loss = "SL")
+    else
+        float tgt = fullTarget == "T1" ? t1 : fullTarget == "T2" ? t2 : t3
+        strategy.exit(eid + " Exit", eid, stop = sl, limit = tgt, comment_profit = fullTarget, comment_loss = "SL")
+    true
+
+// ---------- Strategy trade state ----------
+type StratTrade
+    int   dir       = 0
+    int   signalBar = na
+    float entryRef  = na    // signal close; replaced by the real fill price once filled
+    float sl        = na
+    float t1        = na
+    float t2        = na
+    float t3        = na
+    float qty       = na
+    float q1        = 0.0
+    float q2        = 0.0
+    float q3        = 0.0
+    bool  filled    = false
+    bool  beDone    = false
+    int   closedAtSignal = 0
+
+var StratTrade st = StratTrade.new()
+
+method clear(StratTrade t) =>
+    t.dir      := 0
+    t.filled   := false
+    t.beDone   := false
+    t.entryRef := na
+    t.sl       := na
+    t.t1       := na
+    t.t2       := na
+    t.t3       := na
+    t.qty      := na
+    t
+
+// Send a market entry (fills next bar open) plus its exit orders. Returns true if an order was sent.
+placeOrder(StratTrade t, int d, float entry, float sl) =>
+    float q    = calcQty(entry, sl)
+    bool  sent = false
+    if q > 0
+        string id = d == 1 ? "Long" : "Short"
+        float  rk = d * (entry - sl)
+        t.dir       := d
+        t.signalBar := bar_index
+        t.entryRef  := entry
+        t.sl        := sl
+        t.t1        := math.round_to_mintick(entry + d * rk * t1R)
+        t.t2        := math.round_to_mintick(entry + d * rk * t2R)
+        t.t3        := math.round_to_mintick(entry + d * rk * t3R)
+        t.qty       := q
+        t.q1        := usePartials ? roundQty(q * pctT1 / 100.0) : 0.0
+        t.q2        := usePartials ? roundQty(q * pctT2 / 100.0) : 0.0
+        t.q3        := usePartials ? math.round((q - t.q1 - t.q2) / qtyStep) * qtyStep : q
+        t.filled    := false
+        t.beDone    := false
+        t.closedAtSignal := strategy.closedtrades
+        strategy.entry(id, d == 1 ? strategy.long : strategy.short, qty = q, comment = d == 1 ? "CRT BUY" : "CRT SELL")
+        issueExits(id, t.sl, t.t1, t.t2, t.t3, t.q1, t.q2, t.q3, true, true)
+        sent := true
+        if useDynamicAlerts
+            alert("CRT | " + syminfo.ticker + " " + timeframe.period + " | " + (d == 1 ? "BUY" : "SELL") + " (confirmed; market order at next bar open) | Ref entry " + fmt(entry) +
+                  " | SL " + fmt(sl) + " | T1 " + fmt(t.t1) + " | T2 " + fmt(t.t2) + " | T3 " + fmt(t.t3) + " | Qty " + str.tostring(q), alert.freq_once_per_bar_close)
+    sent
+
+bool inDateRange = not useDateFilter or (time >= startDate and time <= endDate)
+if useDateFilter and closeAtEnd and time > endDate and strategy.position_size != 0
+    strategy.close_all(comment = "Date range end")
+
+// ---------- Per-bar events ----------
+bool evBullSweep = false
+bool evBearSweep = false
+bool evBullMss   = false
+bool evBearMss   = false
+bool evBuy       = false
+bool evSell      = false
+
+if barstate.isconfirmed
+    updatePivots()
+    [newRange, lockedNow] = updateRange(rng)
+    if newRange and resetOnNewRange and rangeMode != RM_PREV
+        bullSetup.reset()
+        bearSetup.reset()
+
+    // 1) Position bookkeeping (the broker emulator has already simulated this bar's fills)
+    float  posQty = math.abs(strategy.position_size)
+    string eid    = st.dir == 1 ? "Long" : "Short"
+    if st.dir != 0 and posQty > 0 and not st.filled
+        // First close after the entry filled
+        st.filled := true
+        bool exitsTouched = strategy.closedtrades > st.closedAtSignal or posQty < st.qty
+        if recalcFromFill and not exitsTouched
+            float fill = strategy.position_avg_price
+            float r    = st.dir * (fill - st.sl)
+            if r <= 0
+                strategy.close(eid, comment = "Fill beyond SL")
+            else
+                st.entryRef := fill
+                st.t1 := math.round_to_mintick(fill + st.dir * r * t1R)
+                st.t2 := math.round_to_mintick(fill + st.dir * r * t2R)
+                st.t3 := math.round_to_mintick(fill + st.dir * r * t3R)
+                issueExits(eid, st.sl, st.t1, st.t2, st.t3, st.q1, st.q2, st.q3, true, true)
+        else
+            st.entryRef := strategy.position_avg_price
+    bool t1Touched = st.dir == 1 ? high >= st.t1 : low <= st.t1
+    if st.dir != 0 and posQty > 0 and st.filled and beAfterT1 and not st.beDone and (posQty < st.qty or t1Touched)
+        // T1 reached → move the remaining exits' stop to break-even (fill price).
+        // Only still-open exit IDs are re-issued, so an already-filled exit is never re-created.
+        st.beDone := true
+        st.sl     := math.round_to_mintick(st.entryRef)
+        bool t2Open = posQty > st.q3 + qtyStep * 0.5
+        issueExits(eid, st.sl, st.t1, st.t2, st.t3, st.q1, st.q2, usePartials and not t2Open ? posQty : st.q3, false, t2Open)
+    if st.dir != 0 and posQty == 0 and bar_index > st.signalBar
+        // Trade finished (or the entry never filled) → clear state
+        st.clear()
+
+    // 2) Setups — identical core logic; filters only decide whether an order is sent
+    bool tradeOpen = posQty > 0 or st.dir != 0
+    bool canLong   = signalSessionOk and inDateRange and dirMode != DM_SHORT
+    bool canShort  = signalSessionOk and inDateRange and dirMode != DM_LONG
+    [bSw, bCf, bMs, bEn, bIv, bE, bS, bMl, bMb, bNote] = processSetup(bullSetup, rng, canLong, tradeOpen)
+    bool placed = false
+    if bEn
+        placed := placeOrder(st, 1, bE, bS)
+    [sSw, sCf, sMs, sEn, sIv, sE, sS, sMl, sMb, sNote] = processSetup(bearSetup, rng, canShort, tradeOpen or placed)
+    if sEn
+        placeOrder(st, -1, sE, sS)
+
+    evBullSweep := bCf
+    evBearSweep := sCf
+    evBullMss   := bMs
+    evBearMss   := sMs
+    evBuy       := bEn
+    evSell      := sEn
+
+// ---------- Plots ----------
+bool inTrade = st.dir != 0
+plot(showLevels and inTrade ? st.entryRef : na, "Entry", color = color.new(#2962ff, 0), style = plot.style_linebr)
+plot(showLevels and inTrade ? st.sl : na, "Stop Loss", color = color.new(#f44336, 0), style = plot.style_linebr, linewidth = 2)
+plot(showLevels and inTrade ? st.t1 : na, "Target 1", color = color.new(#4caf50, 30), style = plot.style_linebr)
+plot(showLevels and inTrade ? st.t2 : na, "Target 2", color = color.new(#4caf50, 30), style = plot.style_linebr)
+plot(showLevels and inTrade ? st.t3 : na, "Target 3", color = color.new(#4caf50, 0), style = plot.style_linebr, linewidth = 2)
+plot(rng.isTradable() ? rng.hi : na, "Range High", color = color.new(#7e57c2, 30), style = plot.style_steplinebr)
+plot(rng.isTradable() ? rng.lo : na, "Range Low", color = color.new(#7e57c2, 30), style = plot.style_steplinebr)
+
+plotshape(showMarkers and evBullSweep, "Bullish Sweep", shape.triangleup, location.belowbar, colBull, size = size.tiny, text = "SW")
+plotshape(showMarkers and evBearSweep, "Bearish Sweep", shape.triangledown, location.abovebar, colBear, size = size.tiny, text = "SW")
+plotshape(showMarkers and evBullMss, "Bullish MSS", shape.diamond, location.belowbar, colBull, size = size.tiny, text = "MSS")
+plotshape(showMarkers and evBearMss, "Bearish MSS", shape.diamond, location.abovebar, colBear, size = size.tiny, text = "MSS")
+plotshape(showMarkers and evBuy, "BUY Signal", shape.arrowup, location.belowbar, colBull, size = size.small)
+plotshape(showMarkers and evSell, "SELL Signal", shape.arrowdown, location.abovebar, colBear, size = size.small)

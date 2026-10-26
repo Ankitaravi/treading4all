@@ -1,0 +1,906 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+indicator("CRT Smart Entry Pro", shorttitle = "CRT SEP", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CRT Smart Entry Pro — Candle Range Theory + Liquidity Sweep + MSS
+//
+// Signal pipeline (per direction):
+//   IDLE ──sweep beyond range──▶ SWEPT ──reclaim──▶ CONFIRMED ──MSS──▶ MSS ──(retest)──▶ ENTRY
+//
+// Non-repainting design:
+//   • All state transitions run only on CONFIRMED (closed) bars: `barstate.isconfirmed`.
+//   • Pivots are confirmed `pivotRight` bars after the swing bar — an inherent,
+//     documented delay. Unconfirmed pivots are never used.
+//   • Higher-timeframe ranges use `request.security(..., [high[1], low[1]],
+//     lookahead = barmerge.lookahead_on)`: only the PREVIOUS, fully closed HTF candle.
+//   • Optional "provisional" sweep hints on the live bar are drawn faded and are
+//     explicitly NOT signals — they may appear and disappear while the bar forms.
+//   • Entry price = close of the signal bar. In live trading the realistic fill is
+//     the next bar's open.
+// This has not been verified as repaint-proof across every symbol/feed/chart type.
+// Use TESTING_CHECKLIST.md before relying on it.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ============================ CORE START ============================
+// The section between CORE START / CORE END is kept byte-identical in
+// CRT_Smart_Entry_Pro.pine and CRT_Smart_Entry_Strategy.pine
+// (verified by tools/check_core_sync.py).
+
+// ---------- Constants ----------
+const string RM_PREV   = "Previous Candle"
+const string RM_HTF    = "Higher Timeframe Candle"
+const string RM_OR     = "Session Opening Range"
+const string RM_FIRST  = "First Session Candle (5m/15m)"
+const string RM_CUSTOM = "Custom Session"
+
+const string SS_AUTO   = "Symbol Session (auto)"
+const string SS_MANUAL = "Manual Session"
+
+const string SW_WICK   = "Wick (high/low)"
+const string SW_CLOSE  = "Close Beyond"
+
+const string CF_CLOSE  = "Close Back Inside"
+const string CF_REJECT = "Rejection Candle"
+
+const string MD_NONE   = "None"
+const string MD_TICKS  = "Ticks"
+const string MD_ATR    = "ATR Multiple"
+const string MD_PCT    = "% of Range"
+
+const string BRK_CLOSE = "Close"
+const string BRK_WICK  = "Wick"
+
+const string EM_CONFIRM = "Confirmation (MSS close)"
+const string EM_RETEST  = "Retest of MSS level"
+
+const string SL_SWEEP  = "Beyond Sweep Extreme"
+const string SL_SWING  = "Beyond Structure Swing"
+const string SL_ATR    = "ATR Based"
+
+const int ST_IDLE      = 0
+const int ST_SWEPT     = 1
+const int ST_CONFIRMED = 2
+const int ST_MSS       = 3
+
+const int MAX_PIVOTS   = 50
+
+const string G_RANGE = "1 · CRT Range"
+const string G_SESS  = "1b · Sessions & Timezone"
+const string G_SWEEP = "2 · Liquidity Sweep"
+const string G_MSS   = "3 · Market Structure Shift"
+const string G_ENTRY = "4 · Entry"
+const string G_RISK  = "5 · Stop Loss & Targets"
+
+// ---------- Inputs: range ----------
+string rangeMode       = input.string(RM_HTF, "Range Source", options = [RM_PREV, RM_HTF, RM_OR, RM_FIRST, RM_CUSTOM], group = G_RANGE,
+      tooltip = "Previous Candle: the last closed chart candle.\nHigher Timeframe Candle: the last CLOSED candle of the selected HTF.\nSession Opening Range: first N minutes of the trading session.\nFirst Session Candle: first 5m or 15m of the session.\nCustom Session: high/low of a user-defined time window (e.g. Asia session).")
+string htfInput        = input.timeframe("60", "Higher Timeframe", group = G_RANGE, tooltip = "Used only by 'Higher Timeframe Candle'. Must be greater than the chart timeframe.")
+int    orMinutes       = input.int(15, "Opening Range Duration (minutes)", minval = 1, group = G_RANGE, tooltip = "Used only by 'Session Opening Range'. Chart timeframe should be ≤ this value for an exact range.")
+string firstCandleSize = input.string("15", "First Candle Size (minutes)", options = ["5", "15"], group = G_RANGE, tooltip = "Used only by 'First Session Candle'. Chart timeframe should be ≤ this value.")
+bool   resetOnNewRange = input.bool(true, "Reset pending setups when a new range starts", group = G_RANGE, tooltip = "Ignored in 'Previous Candle' mode (a new range starts every bar there; pending setups keep their own snapshot of the swept level and expire by their timeouts).")
+int    maxSignalsPerRange = input.int(1, "Max signals per range (per direction)", minval = 1, maxval = 20, group = G_RANGE)
+
+// ---------- Inputs: sessions ----------
+string sessSource = input.string(SS_AUTO, "Session Start Source", options = [SS_AUTO, SS_MANUAL], group = G_SESS,
+      tooltip = "Symbol Session (auto): uses the symbol's own regular session from TradingView (first regular bar of each session).\nManual Session: uses the session string below in the selected timezone.")
+string sessInput  = input.session("0000-0000", "Manual Trading Session", group = G_SESS, tooltip = "Used when Session Start Source = Manual. '0000-0000' = 24h session (starts each new day in the selected timezone).")
+string customSess = input.session("0000-0600", "Custom Range Session", group = G_SESS, tooltip = "Used only by 'Custom Session' range source. Range locks when this window ends.")
+string tzInput    = input.string("Exchange", "Timezone", group = G_SESS, tooltip = "'Exchange' = the symbol's exchange timezone. Otherwise an IANA name (e.g. 'Asia/Kolkata', 'America/New_York', 'UTC') or 'GMT+5:30'.")
+bool   useSignalSess = input.bool(false, "Only allow entries inside a signal session", group = G_SESS)
+string signalSess = input.session("0000-0000", "Signal Session", group = G_SESS)
+
+// ---------- Inputs: sweep ----------
+string sweepType      = input.string(SW_WICK, "Sweep Detection", options = [SW_WICK, SW_CLOSE], group = G_SWEEP,
+      tooltip = "Wick: a high/low beyond the range boundary counts as a sweep.\nClose Beyond: the candle must also CLOSE beyond the boundary (reclaim must then happen on a later bar).")
+string confirmMode    = input.string(CF_CLOSE, "Sweep Confirmation", options = [CF_CLOSE, CF_REJECT], group = G_SWEEP,
+      tooltip = "Close Back Inside: a close back inside the range.\nRejection Candle: close back inside + candle body in the trade direction + rejection wick ≥ the % below.")
+int    maxReclaimBars = input.int(3, "Max bars to confirm (reclaim)", minval = 0, maxval = 50, group = G_SWEEP, tooltip = "0 = the reclaim must happen on the sweep candle itself.")
+string minSweepMode   = input.string(MD_NONE, "Minimum Sweep Distance", options = [MD_NONE, MD_TICKS, MD_ATR, MD_PCT], group = G_SWEEP, inline = "msd")
+float  minSweepValue  = input.float(0.0, "", minval = 0.0, step = 0.05, group = G_SWEEP, inline = "msd")
+float  rejWickPct     = input.float(40.0, "Rejection wick ≥ % of candle", minval = 0.0, maxval = 100.0, group = G_SWEEP)
+
+// ---------- Inputs: MSS ----------
+int    pivotLeft    = input.int(3, "Pivot Left Bars", minval = 1, maxval = 50, group = G_MSS)
+int    pivotRight   = input.int(2, "Pivot Right Bars (confirmation delay)", minval = 1, maxval = 50, group = G_MSS,
+      tooltip = "A swing is confirmed only after this many bars have closed to its right. This delay is intentional and prevents repainting pivots.")
+string mssBreakType = input.string(BRK_CLOSE, "MSS Break Type", options = [BRK_CLOSE, BRK_WICK], group = G_MSS)
+int    maxBarsToMss = input.int(20, "Max bars from sweep confirmation to MSS", minval = 1, maxval = 500, group = G_MSS)
+int    swingMaxAge  = input.int(100, "Max swing age (bars)", minval = 5, maxval = 1000, group = G_MSS, tooltip = "Only swings formed within this many bars are used as MSS / structure-stop references.")
+
+// ---------- Inputs: entry ----------
+string entryMode     = input.string(EM_CONFIRM, "Entry Mode", options = [EM_CONFIRM, EM_RETEST], group = G_ENTRY)
+float  retestTolAtr  = input.float(0.10, "Retest tolerance (× ATR)", minval = 0.0, step = 0.05, group = G_ENTRY)
+int    maxRetestBars = input.int(10, "Max bars to wait for retest", minval = 1, maxval = 200, group = G_ENTRY)
+
+// ---------- Inputs: risk ----------
+string slMethod    = input.string(SL_SWEEP, "Stop-Loss Method", options = [SL_SWEEP, SL_SWING, SL_ATR], group = G_RISK)
+int    atrLen      = input.int(14, "ATR Length", minval = 1, group = G_RISK)
+float  slAtrMult   = input.float(1.5, "ATR Stop Multiple", minval = 0.1, step = 0.1, group = G_RISK)
+float  slBufferAtr = input.float(0.05, "Stop Buffer (× ATR)", minval = 0.0, step = 0.01, group = G_RISK, tooltip = "Extra distance beyond the sweep extreme / swing. Not applied to ATR-based stops.")
+float  maxRiskAtr  = input.float(0.0, "Max Risk (× ATR, 0 = off)", minval = 0.0, step = 0.5, group = G_RISK)
+float  t1R         = input.float(1.0, "Target 1 (R)", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+float  t2R         = input.float(2.0, "T2", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+float  t3R         = input.float(3.0, "T3", minval = 0.1, step = 0.5, group = G_RISK, inline = "tr")
+bool   beAfterT1   = input.bool(false, "Move stop to break-even after T1", group = G_RISK)
+
+// ---------- Global calculations (executed on every bar, unconditionally) ----------
+float atrVal = ta.atr(atrLen)
+float ph     = ta.pivothigh(high, pivotLeft, pivotRight)
+float pl     = ta.pivotlow(low, pivotLeft, pivotRight)
+
+string tzEff = tzInput == "Exchange" or tzInput == "" ? syminfo.timezone : tzInput
+
+// Higher timeframe: previous CLOSED HTF candle only ([1] + lookahead_on = no future data, no repaint).
+// Every requested expression is offset by [1]; the previous HTF bar's open time changes exactly
+// when a new HTF bar starts, which is how a new range is detected.
+bool   htfValid = timeframe.in_seconds(htfInput) > timeframe.in_seconds(timeframe.period)
+string htfEff   = htfValid ? htfInput : timeframe.period
+[htfHi, htfLo, htfPrevTime] = request.security(syminfo.tickerid, htfEff, [high[1], low[1], time[1]], lookahead = barmerge.lookahead_on)
+bool htfNewBar = bar_index > 0 and not na(htfPrevTime) and htfPrevTime != htfPrevTime[1]
+if rangeMode == RM_HTF and not htfValid
+    runtime.error("CRT: 'Higher Timeframe' (" + htfInput + ") must be greater than the chart timeframe (" + timeframe.period + ").")
+
+// Session start detection (auto = symbol's regular session; manual = session string + timezone)
+bool inManualSess    = not na(time(timeframe.period, sessInput, tzEff))
+int  dayKey          = dayofmonth(time, tzEff)
+bool newDayTz        = bar_index > 0 and dayKey != dayKey[1]
+bool sessAllDay      = str.startswith(sessInput, "0000-0000")
+bool manualSessStart = inManualSess and (not inManualSess[1] or (sessAllDay and newDayTz))
+bool sessionStart    = sessSource == SS_AUTO ? session.isfirstbar_regular : manualSessStart
+
+// Opening-range / first-candle window
+int orMinutesEff = rangeMode == RM_FIRST ? (firstCandleSize == "15" ? 15 : 5) : orMinutes
+var int orStartTime = na
+if sessionStart
+    orStartTime := time
+bool orWindowActive = not na(orStartTime) and time >= orStartTime and time < orStartTime + orMinutesEff * 60000
+
+// Custom session window
+bool customActive = not na(time(timeframe.period, customSess, tzEff))
+
+bool isOrMode      = rangeMode == RM_OR or rangeMode == RM_FIRST
+bool isWindowMode  = isOrMode or rangeMode == RM_CUSTOM
+bool windowActive  = rangeMode == RM_CUSTOM ? customActive : isOrMode ? orWindowActive : false
+bool windowStart   = rangeMode == RM_CUSTOM ? (customActive and not customActive[1]) : isOrMode ? sessionStart : false
+bool windowEnd     = windowActive[1] and not windowActive
+
+// A new reference range begins on this bar (time-based, known at bar open)
+bool newRangeEvt = rangeMode == RM_PREV ? bar_index > 0 : rangeMode == RM_HTF ? htfNewBar : windowStart
+
+bool signalSessionOk = not useSignalSess or not na(time(timeframe.period, signalSess, tzEff))
+
+// ---------- Types ----------
+type CRTRange
+    float hi          = na
+    float lo          = na
+    float mid         = na
+    int   startBar    = na
+    bool  locked      = false   // true once the range is complete and tradable
+    int   id          = 0
+    bool  lowSwept    = false
+    bool  highSwept   = false
+    int   bullSignals = 0
+    int   bearSignals = 0
+
+type Setup
+    int   dir         = 0       // +1 bullish, -1 bearish
+    int   state       = 0       // ST_IDLE / ST_SWEPT / ST_CONFIRMED / ST_MSS
+    int   rangeId     = 0
+    float level       = na      // swept range boundary (range low for bull, range high for bear)
+    float extreme     = na      // sweep extreme (lowest low / highest high since the sweep)
+    int   sweepBar    = na
+    int   confirmBar  = na
+    float mssLevel    = na      // confirmed swing used for the MSS
+    int   mssPivotBar = na
+    int   mssBar      = na
+
+// ---------- Methods & helpers ----------
+method isTradable(CRTRange r) =>
+    r.locked and not na(r.hi) and not na(r.lo) and r.hi > r.lo
+
+method startRange(CRTRange r, float hi, float lo, int startBar, bool locked) =>
+    r.id          := r.id + 1
+    r.hi          := hi
+    r.lo          := lo
+    r.mid         := (hi + lo) / 2.0
+    r.startBar    := startBar
+    r.locked      := locked
+    r.lowSwept    := false
+    r.highSwept   := false
+    r.bullSignals := 0
+    r.bearSignals := 0
+    r
+
+method reset(Setup s) =>
+    s.state       := ST_IDLE
+    s.rangeId     := 0
+    s.level       := na
+    s.extreme     := na
+    s.sweepBar    := na
+    s.confirmBar  := na
+    s.mssLevel    := na
+    s.mssPivotBar := na
+    s.mssBar      := na
+    s
+
+var array<float> phVals = array.new<float>()
+var array<int>   phBars = array.new<int>()
+var array<float> plVals = array.new<float>()
+var array<int>   plBars = array.new<int>()
+
+// Store newly CONFIRMED pivots (pivot bar = bar_index - pivotRight). Call on confirmed bars only.
+updatePivots() =>
+    if not na(ph)
+        phVals.push(ph)
+        phBars.push(bar_index - pivotRight)
+        if phVals.size() > MAX_PIVOTS
+            phVals.shift()
+            phBars.shift()
+    if not na(pl)
+        plVals.push(pl)
+        plBars.push(bar_index - pivotRight)
+        if plVals.size() > MAX_PIVOTS
+            plVals.shift()
+            plBars.shift()
+    true
+
+// Most recent confirmed pivot on the requested side of `ref` (side = +1 above, -1 below), within swingMaxAge.
+findLevel(array<float> vals, array<int> bars, int side, float ref) =>
+    float lvl  = na
+    int   pBar = na
+    int   n    = vals.size()
+    if n > 0 and not na(ref)
+        for i = n - 1 to 0
+            int b = bars.get(i)
+            if bar_index - b > swingMaxAge
+                break
+            float v = vals.get(i)
+            if side * (v - ref) > 0
+                lvl  := v
+                pBar := b
+                break
+    [lvl, pBar]
+
+minSweepDistance(float rangeSize) =>
+    switch minSweepMode
+        MD_TICKS => minSweepValue * syminfo.mintick
+        MD_ATR   => minSweepValue * nz(atrVal)
+        MD_PCT   => minSweepValue / 100.0 * rangeSize
+        => 0.0
+
+rejectionOk(int d) =>
+    float barRange = high - low
+    float wick     = d == 1 ? math.min(open, close) - low : high - math.max(open, close)
+    barRange > 0 and d * (close - open) > 0 and wick / barRange * 100.0 >= rejWickPct
+
+// Stop-loss price for direction d. Returns na if it cannot be computed.
+calcStop(int d, float entry, float extreme) =>
+    float buf  = nz(atrVal) * slBufferAtr
+    float base = na
+    if slMethod == SL_ATR
+        base := na(atrVal) ? na : entry - d * atrVal * slAtrMult
+        buf  := 0.0
+    else if slMethod == SL_SWING
+        [swLvl, swBar] = findLevel(d == 1 ? plVals : phVals, d == 1 ? plBars : phBars, -d, entry)
+        base := na(swLvl) ? extreme : swLvl
+    else
+        base := extreme
+    na(base) ? na : math.round_to_mintick(base - d * buf)
+
+// Range builder. Call on confirmed bars only. Returns [newRangeStarted, rangeLockedNow].
+updateRange(CRTRange r) =>
+    bool started   = false
+    bool lockedNow = false
+    if rangeMode == RM_PREV
+        if bar_index > 0 and high[1] > low[1]
+            r.startRange(high[1], low[1], bar_index - 1, true)
+            started   := true
+            lockedNow := true
+    else if rangeMode == RM_HTF
+        if htfNewBar and not na(htfHi) and not na(htfLo) and htfHi > htfLo
+            r.startRange(htfHi, htfLo, bar_index, true)
+            started   := true
+            lockedNow := true
+    else
+        if windowStart
+            r.startRange(high, low, bar_index, false)
+            started := true
+        else if windowActive and not r.locked and not na(r.hi)
+            r.hi  := math.max(r.hi, high)
+            r.lo  := math.min(r.lo, low)
+            r.mid := (r.hi + r.lo) / 2.0
+        if windowEnd and not r.locked and not na(r.hi) and r.hi > r.lo
+            r.locked  := true
+            lockedNow := true
+    [started, lockedNow]
+
+// Core CRT state machine for one direction. Call on confirmed bars only.
+// canEnter: external entry filters (session/date/direction). tradeOpen: a trade is already running.
+// Returns [evSweep, evConfirm, evMss, evEntry, evInvalid, entryPx, slPx, mssLvl, mssPivotBar, note]
+processSetup(Setup s, CRTRange r, bool canEnter, bool tradeOpen) =>
+    int    d         = s.dir
+    bool   evSweep   = false
+    bool   evConfirm = false
+    bool   evMss     = false
+    bool   evEntry   = false
+    bool   evInvalid = false
+    float  entryPx   = na
+    float  slPx      = na
+    float  mssLvl    = na
+    int    mssPivot  = na
+    string note      = ""
+    float  adverse   = d == 1 ? low : high
+
+    // IDLE → SWEPT: price trades beyond the locked range boundary
+    if s.state == ST_IDLE and r.isTradable() and not na(atrVal)
+        int   used    = d == 1 ? r.bullSignals : r.bearSignals
+        float level   = d == 1 ? r.lo : r.hi
+        float pierce  = d * (level - adverse)
+        bool  closeOk = sweepType == SW_WICK or d * (level - close) > 0
+        if used < maxSignalsPerRange and pierce > 0 and pierce >= minSweepDistance(r.hi - r.lo) and closeOk
+            s.state    := ST_SWEPT
+            s.rangeId  := r.id
+            s.level    := level
+            s.extreme  := adverse
+            s.sweepBar := bar_index
+            evSweep    := true
+            if d == 1
+                r.lowSwept := true
+            else
+                r.highSwept := true
+
+    // SWEPT → CONFIRMED: close back inside the range (optionally with a rejection candle)
+    if s.state == ST_SWEPT
+        s.extreme := d == 1 ? math.min(s.extreme, low) : math.max(s.extreme, high)
+        bool backInside = d * (close - s.level) > 0
+        bool confirmOk  = confirmMode == CF_CLOSE ? backInside : backInside and rejectionOk(d)
+        if confirmOk
+            s.state      := ST_CONFIRMED
+            s.confirmBar := bar_index
+            evConfirm    := true
+            // MSS reference: most recent CONFIRMED swing beyond the current close
+            [lvlA, barA] = findLevel(d == 1 ? phVals : plVals, d == 1 ? phBars : plBars, d, close)
+            s.mssLevel    := lvlA
+            s.mssPivotBar := barA
+        else if bar_index - s.sweepBar >= maxReclaimBars
+            evInvalid := true
+            note      := "no reclaim within " + str.tostring(maxReclaimBars) + " bar(s)"
+            s.reset()
+
+    // CONFIRMED → MSS: break of a previously confirmed swing (next bar onward)
+    if s.state == ST_CONFIRMED and bar_index > s.confirmBar
+        s.extreme := d == 1 ? math.min(s.extreme, low) : math.max(s.extreme, high)
+        if d * (close - s.level) <= 0
+            // Closed back beyond the swept level: sweep still in progress, wait for a new reclaim
+            s.state       := ST_SWEPT
+            s.sweepBar    := bar_index
+            s.mssLevel    := na
+            s.mssPivotBar := na
+        else
+            if na(s.mssLevel)
+                [lvlB, barB] = findLevel(d == 1 ? phVals : plVals, d == 1 ? phBars : plBars, d, close)
+                s.mssLevel    := lvlB
+                s.mssPivotBar := barB
+            float brkPx = mssBreakType == BRK_CLOSE ? close : (d == 1 ? high : low)
+            if not na(s.mssLevel) and d * (brkPx - s.mssLevel) > 0
+                s.state  := ST_MSS
+                s.mssBar := bar_index
+                evMss    := true
+                mssLvl   := s.mssLevel
+                mssPivot := s.mssPivotBar
+            else if bar_index - s.confirmBar >= maxBarsToMss
+                evInvalid := true
+                note      := "no MSS within " + str.tostring(maxBarsToMss) + " bars"
+                s.reset()
+
+    // MSS → ENTRY
+    bool wantEntry = false
+    if s.state == ST_MSS
+        if entryMode == EM_CONFIRM
+            wantEntry := true
+        else if bar_index > s.mssBar
+            float tol      = nz(atrVal) * retestTolAtr
+            bool  touched  = d == 1 ? low <= s.mssLevel + tol : high >= s.mssLevel - tol
+            bool  rejected = d * (close - s.mssLevel) > 0 and d * (close - open) > 0
+            if d * (close - s.extreme) <= 0
+                evInvalid := true
+                note      := "closed beyond sweep extreme before retest"
+                s.reset()
+            else if touched and rejected
+                wantEntry := true
+            else if bar_index - s.mssBar >= maxRetestBars
+                evInvalid := true
+                note      := "no retest within " + str.tostring(maxRetestBars) + " bars"
+                s.reset()
+
+    if wantEntry
+        float ePx  = close
+        float sPx  = calcStop(d, ePx, s.extreme)
+        float risk = na(sPx) ? na : d * (ePx - sPx)
+        if na(risk) or na(atrVal)
+            note := "stop unavailable"
+        else if risk <= syminfo.mintick * 0.5
+            note := "invalid risk (stop on wrong side of entry or zero)"
+        else if maxRiskAtr > 0 and risk > maxRiskAtr * atrVal
+            note := "risk exceeds " + str.tostring(maxRiskAtr) + " × ATR"
+        else if not canEnter
+            note := "entry blocked by session/date/direction filter"
+        else if tradeOpen
+            note := "skipped: a trade is already active"
+        if note == ""
+            evEntry := true
+            entryPx := ePx
+            slPx    := sPx
+            if d == 1
+                r.bullSignals := r.bullSignals + 1
+            else
+                r.bearSignals := r.bearSignals + 1
+        else
+            evInvalid := true
+        s.reset()
+
+    [evSweep, evConfirm, evMss, evEntry, evInvalid, entryPx, slPx, mssLvl, mssPivot, note]
+
+setupText(Setup s) =>
+    switch s.state
+        ST_SWEPT     => "Swept · awaiting reclaim"
+        ST_CONFIRMED => "Sweep confirmed · awaiting MSS"
+        ST_MSS       => "MSS · awaiting retest"
+        => "Idle"
+
+fmt(float v) =>
+    na(v) ? "—" : str.tostring(v, format.mintick)
+
+// ---------- Persistent state ----------
+var CRTRange rng       = CRTRange.new()
+var Setup    bullSetup = Setup.new(dir = 1)
+var Setup    bearSetup = Setup.new(dir = -1)
+// ============================ CORE END ==============================
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INDICATOR-ONLY SECTION: trade tracking, drawings, dashboard, alerts
+// ═════════════════════════════════════════════════════════════════════════════
+
+const string G_VIS   = "6 · Visuals"
+const string G_COL   = "6b · Colors"
+const string G_DASH  = "7 · Dashboard"
+const string G_ALERT = "8 · Alerts"
+
+bool showRange       = input.bool(true, "Range High / Low lines", group = G_VIS)
+bool showMid         = input.bool(true, "Range Midpoint line", group = G_VIS)
+bool showSweeps      = input.bool(true, "Sweep markers", group = G_VIS)
+bool showMss         = input.bool(true, "MSS markers", group = G_VIS)
+bool showMssLines    = input.bool(true, "MSS level lines", group = G_VIS)
+bool showSignals     = input.bool(true, "BUY / SELL labels (with prices)", group = G_VIS)
+bool showSigMarkers  = input.bool(true, "BUY / SELL arrows (full history)", group = G_VIS)
+bool showTradeLines  = input.bool(true, "Entry / SL / T1 / T2 / T3 lines", group = G_VIS)
+bool showLevelLabels = input.bool(true, "Price tags on latest trade levels", group = G_VIS)
+bool showZones       = input.bool(false, "Shaded risk / reward zones", group = G_VIS)
+bool showProvisional = input.bool(false, "Provisional sweep hints on live bar (NOT signals, may vanish)", group = G_VIS)
+int  levelsHistory   = input.int(3, "Trades with level lines kept", minval = 1, maxval = 50, group = G_VIS)
+int  labelsHistory   = input.int(30, "Trades with labels kept", minval = 1, maxval = 200, group = G_VIS)
+int  mssLineHistory  = input.int(10, "MSS lines kept", minval = 1, maxval = 100, group = G_VIS)
+
+color colBull  = input.color(#26a69a, "Bullish", group = G_COL, inline = "c1")
+color colBear  = input.color(#ef5350, "Bearish", group = G_COL, inline = "c1")
+color colRange = input.color(#7e57c2, "Range", group = G_COL, inline = "c2")
+color colMid   = input.color(#9e9e9e, "Mid", group = G_COL, inline = "c2")
+color colEntry = input.color(#2962ff, "Entry", group = G_COL, inline = "c3")
+color colSL    = input.color(#f44336, "SL", group = G_COL, inline = "c3")
+color colTP    = input.color(#4caf50, "Targets", group = G_COL, inline = "c3")
+
+bool   showDashboard = input.bool(true, "Show dashboard", group = G_DASH)
+string dashPosIn     = input.string("Top Right", "Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group = G_DASH)
+string dashSizeIn    = input.string("Small", "Text size", options = ["Tiny", "Small", "Normal"], group = G_DASH)
+
+bool useDynamicAlerts = input.bool(true, "Enable dynamic alert() messages", group = G_ALERT,
+      tooltip = "Create one alert with condition 'Any alert() function call' to receive messages containing symbol, timeframe, direction, entry, SL and targets.")
+
+// ---------- Trade type (indicator-side tracking) ----------
+type Trade
+    int    dir      = 0
+    float  entry    = na
+    float  sl       = na
+    float  initSl   = na
+    float  risk     = na
+    float  t1       = na
+    float  t2       = na
+    float  t3       = na
+    int    entryBar = na
+    int    exitBar  = na
+    bool   active   = false
+    bool   t1Hit    = false
+    bool   t2Hit    = false
+    bool   t3Hit    = false
+    bool   slHit    = false
+    bool   beActive = false
+    string outcome  = ""
+    line   lnEntry  = na
+    line   lnSl     = na
+    line   lnT1     = na
+    line   lnT2     = na
+    line   lnT3     = na
+    box    bxRisk   = na
+    box    bxReward = na
+    label  lbl      = na
+
+// Evaluate exits on bars AFTER the entry bar. Conservative rule: if the stop and a target
+// are both touched inside the same bar, the stop is assumed to have been hit first.
+method manage(Trade t) =>
+    bool hT1 = false
+    bool hT2 = false
+    bool hT3 = false
+    bool hSL = false
+    if t.active and bar_index > t.entryBar
+        int   d      = t.dir
+        float adv    = d == 1 ? low : high
+        float fav    = d == 1 ? high : low
+        if d * (adv - t.sl) <= 0
+            hSL       := true
+            t.slHit   := true
+            t.active  := false
+            t.exitBar := bar_index
+            t.outcome := t.beActive ? "Break-even stop" : "Stop loss"
+        else
+            if not t.t1Hit and d * (fav - t.t1) >= 0
+                t.t1Hit := true
+                hT1     := true
+            if not t.t2Hit and d * (fav - t.t2) >= 0
+                t.t2Hit := true
+                hT2     := true
+            if not t.t3Hit and d * (fav - t.t3) >= 0
+                t.t3Hit   := true
+                hT3       := true
+                t.active  := false
+                t.exitBar := bar_index
+                t.outcome := "Target 3"
+            if hT1 and beAfterT1 and t.active
+                t.sl       := t.entry
+                t.beActive := true
+    [hT1, hT2, hT3, hSL]
+
+method updateDrawings(Trade t) =>
+    int x2 = t.active ? bar_index + 1 : t.exitBar
+    if not na(t.lnEntry)
+        t.lnEntry.set_x2(x2)
+    if not na(t.lnSl)
+        t.lnSl.set_x2(x2)
+        t.lnSl.set_y1(t.sl)
+        t.lnSl.set_y2(t.sl)
+        if t.beActive
+            t.lnSl.set_style(line.style_dotted)
+    if not na(t.lnT1)
+        t.lnT1.set_x2(x2)
+    if not na(t.lnT2)
+        t.lnT2.set_x2(x2)
+    if not na(t.lnT3)
+        t.lnT3.set_x2(x2)
+    if not na(t.bxRisk)
+        t.bxRisk.set_right(x2)
+    if not na(t.bxReward)
+        t.bxReward.set_right(x2)
+    t
+
+method deleteLevels(Trade t) =>
+    line.delete(t.lnEntry)
+    line.delete(t.lnSl)
+    line.delete(t.lnT1)
+    line.delete(t.lnT2)
+    line.delete(t.lnT3)
+    box.delete(t.bxRisk)
+    box.delete(t.bxReward)
+    t.lnEntry  := na
+    t.lnSl     := na
+    t.lnT1     := na
+    t.lnT2     := na
+    t.lnT3     := na
+    t.bxRisk   := na
+    t.bxReward := na
+    t
+
+method deleteLabel(Trade t) =>
+    label.delete(t.lbl)
+    t.lbl := na
+    t
+
+openTrade(int d, float entry, float sl) =>
+    float risk = d * (entry - sl)
+    Trade t = Trade.new(dir = d, entry = entry, sl = sl, initSl = sl, risk = risk, entryBar = bar_index, active = true)
+    t.t1 := math.round_to_mintick(entry + d * risk * t1R)
+    t.t2 := math.round_to_mintick(entry + d * risk * t2R)
+    t.t3 := math.round_to_mintick(entry + d * risk * t3R)
+    if showTradeLines
+        t.lnEntry := line.new(bar_index, entry, bar_index + 1, entry, color = colEntry, width = 2)
+        t.lnSl    := line.new(bar_index, sl, bar_index + 1, sl, color = colSL, width = 2)
+        t.lnT1    := line.new(bar_index, t.t1, bar_index + 1, t.t1, color = colTP, style = line.style_dashed)
+        t.lnT2    := line.new(bar_index, t.t2, bar_index + 1, t.t2, color = colTP, style = line.style_dashed)
+        t.lnT3    := line.new(bar_index, t.t3, bar_index + 1, t.t3, color = colTP, width = 2)
+    if showZones
+        t.bxRisk   := box.new(bar_index, math.max(entry, sl), bar_index + 1, math.min(entry, sl), border_color = color.new(colSL, 100), bgcolor = color.new(colSL, 85))
+        t.bxReward := box.new(bar_index, math.max(entry, t.t3), bar_index + 1, math.min(entry, t.t3), border_color = color.new(colTP, 100), bgcolor = color.new(colTP, 85))
+    if showSignals
+        string txt = (d == 1 ? "BUY" : "SELL") + "\nE " + fmt(entry) + "  SL " + fmt(sl)
+        string tip = (d == 1 ? "BUY" : "SELL") + " (confirmed at bar close)\nEntry: " + fmt(entry) + "\nStop: " + fmt(sl) + "\nRisk: " + fmt(risk) +
+              "\nT1 (" + str.tostring(t1R) + "R): " + fmt(t.t1) + "\nT2 (" + str.tostring(t2R) + "R): " + fmt(t.t2) + "\nT3 (" + str.tostring(t3R) + "R): " + fmt(t.t3)
+        t.lbl := label.new(bar_index, d == 1 ? low : high, txt, style = d == 1 ? label.style_label_up : label.style_label_down,
+              color = d == 1 ? colBull : colBear, textcolor = color.white, size = size.small, tooltip = tip)
+    t
+
+// ---------- Indicator state ----------
+var array<Trade> trades   = array.new<Trade>()
+var array<line>  mssLines = array.new<line>()
+var string lastNote = ""
+
+// Keep object counts bounded: delete level drawings / labels of older trades.
+pruneHistory() =>
+    int n = trades.size()
+    if n > levelsHistory
+        trades.get(n - 1 - levelsHistory).deleteLevels()
+    if n > labelsHistory
+        Trade oldest = trades.shift()
+        oldest.deleteLevels()
+        oldest.deleteLabel()
+    true
+
+addMsg(string acc, string m) =>
+    acc == "" ? m : acc + "\n" + m
+
+string alertPrefix = "CRT | " + syminfo.ticker + " " + timeframe.period + " | "
+
+// ---------- Per-bar events (set only on confirmed bars) ----------
+bool evBullSweep = false
+bool evBearSweep = false
+bool evBullMss   = false
+bool evBearMss   = false
+bool evBuy       = false
+bool evSell      = false
+bool evT1        = false
+bool evT2        = false
+bool evT3        = false
+bool evSL        = false
+string alertMsg  = ""
+
+if barstate.isconfirmed
+    updatePivots()
+    [newRange, lockedNow] = updateRange(rng)
+    if newRange and resetOnNewRange and rangeMode != RM_PREV
+        bullSetup.reset()
+        bearSetup.reset()
+
+    // 1) Manage the running trade first (exits are evaluated before new entries on the same bar)
+    if trades.size() > 0
+        Trade t = trades.last()
+        if t.active
+            [h1, h2, h3, hs] = t.manage()
+            evT1 := h1
+            evT2 := h2
+            evT3 := h3
+            evSL := hs
+            string side = t.dir == 1 ? "LONG" : "SHORT"
+            if h1
+                alertMsg := addMsg(alertMsg, alertPrefix + side + " Target 1 hit @ " + fmt(t.t1))
+            if h2
+                alertMsg := addMsg(alertMsg, alertPrefix + side + " Target 2 hit @ " + fmt(t.t2))
+            if h3
+                alertMsg := addMsg(alertMsg, alertPrefix + side + " Target 3 hit @ " + fmt(t.t3) + " (trade closed)")
+            if hs
+                alertMsg := addMsg(alertMsg, alertPrefix + side + " " + t.outcome + " hit @ " + fmt(t.sl) + " (trade closed)")
+            t.updateDrawings()
+
+    // 2) Setups (bull first, then bear). Only one trade at a time.
+    bool tradeOpen = trades.size() > 0 and trades.last().active
+    [bSw, bCf, bMs, bEn, bIv, bE, bS, bMl, bMb, bNote] = processSetup(bullSetup, rng, signalSessionOk, tradeOpen)
+    if bEn
+        trades.push(openTrade(1, bE, bS))
+        pruneHistory()
+        tradeOpen := true
+    [sSw, sCf, sMs, sEn, sIv, sE, sS, sMl, sMb, sNote] = processSetup(bearSetup, rng, signalSessionOk, tradeOpen)
+    if sEn
+        trades.push(openTrade(-1, sE, sS))
+        pruneHistory()
+
+    evBullSweep := bCf
+    evBearSweep := sCf
+    evBullMss   := bMs
+    evBearMss   := sMs
+    evBuy       := bEn
+    evSell      := sEn
+    if bIv
+        lastNote := "Bull setup reset: " + bNote
+    if sIv
+        lastNote := "Bear setup reset: " + sNote
+
+    // MSS level lines (bounded history)
+    if showMssLines and bMs and not na(bMb)
+        mssLines.push(line.new(bMb, bMl, bar_index, bMl, color = colBull, style = line.style_dashed))
+    if showMssLines and sMs and not na(sMb)
+        mssLines.push(line.new(sMb, sMl, bar_index, sMl, color = colBear, style = line.style_dashed))
+    while mssLines.size() > mssLineHistory
+        line.delete(mssLines.shift())
+
+    // Dynamic alert text
+    if bCf
+        alertMsg := addMsg(alertMsg, alertPrefix + "Bullish liquidity sweep confirmed (range low " + fmt(rng.lo) + ")")
+    if sCf
+        alertMsg := addMsg(alertMsg, alertPrefix + "Bearish liquidity sweep confirmed (range high " + fmt(rng.hi) + ")")
+    if bMs
+        alertMsg := addMsg(alertMsg, alertPrefix + "Bullish MSS: close above swing high " + fmt(bMl))
+    if sMs
+        alertMsg := addMsg(alertMsg, alertPrefix + "Bearish MSS: close below swing low " + fmt(sMl))
+    if bEn or sEn
+        Trade nt = trades.last()
+        alertMsg := addMsg(alertMsg, alertPrefix + (nt.dir == 1 ? "BUY" : "SELL") + " (confirmed) | Entry " + fmt(nt.entry) + " | SL " + fmt(nt.sl) +
+              " | T1 " + fmt(nt.t1) + " | T2 " + fmt(nt.t2) + " | T3 " + fmt(nt.t3) + " | Risk " + fmt(nt.risk) + " | R:R 1:" + str.tostring(t3R))
+    if useDynamicAlerts and alertMsg != ""
+        alert(alertMsg, alert.freq_once_per_bar_close)
+
+// ---------- Latest trade values (for plots / alerts / dashboard) ----------
+Trade lastTrade = na
+if trades.size() > 0
+    lastTrade := trades.last()
+bool  hasTrade  = not na(lastTrade)
+bool  liveLvls  = hasTrade and (lastTrade.active or lastTrade.exitBar == bar_index)
+float aEntry    = na
+float aSL       = na
+float aT1       = na
+float aT2       = na
+float aT3       = na
+if liveLvls
+    aEntry := lastTrade.entry
+    aSL    := lastTrade.sl
+    aT1    := lastTrade.t1
+    aT2    := lastTrade.t2
+    aT3    := lastTrade.t3
+
+// ---------- Provisional (live-bar) hints: NOT signals ----------
+bool provBull = showProvisional and not barstate.isconfirmed and rng.isTradable() and bullSetup.state == ST_IDLE and low < rng.lo
+bool provBear = showProvisional and not barstate.isconfirmed and rng.isTradable() and bearSetup.state == ST_IDLE and high > rng.hi
+
+// ---------- Plots ----------
+bool  breakRangePlot = newRangeEvt and rangeMode != RM_PREV
+color rangeCol = rng.locked ? colRange : color.new(colRange, 60)
+plot(showRange and not breakRangePlot ? rng.hi : na, "Range High", color = rangeCol, linewidth = 2, style = plot.style_steplinebr)
+plot(showRange and not breakRangePlot ? rng.lo : na, "Range Low", color = rangeCol, linewidth = 2, style = plot.style_steplinebr)
+plot(showMid and not breakRangePlot ? rng.mid : na, "Range Mid", color = color.new(colMid, 20), linewidth = 1, style = plot.style_steplinebr)
+
+plotshape(showSweeps and evBullSweep, "Bullish Sweep", shape.triangleup, location.belowbar, colBull, size = size.tiny, text = "SW")
+plotshape(showSweeps and evBearSweep, "Bearish Sweep", shape.triangledown, location.abovebar, colBear, size = size.tiny, text = "SW")
+plotshape(showMss and evBullMss, "Bullish MSS", shape.diamond, location.belowbar, colBull, size = size.tiny, text = "MSS")
+plotshape(showMss and evBearMss, "Bearish MSS", shape.diamond, location.abovebar, colBear, size = size.tiny, text = "MSS")
+plotshape(showSigMarkers and evBuy, "BUY Signal", shape.arrowup, location.belowbar, colBull, size = size.small)
+plotshape(showSigMarkers and evSell, "SELL Signal", shape.arrowdown, location.abovebar, colBear, size = size.small)
+plotshape(provBull, "Provisional Bull Sweep (unconfirmed)", shape.circle, location.belowbar, color.new(colBull, 60), size = size.tiny, text = "sw?")
+plotshape(provBear, "Provisional Bear Sweep (unconfirmed)", shape.circle, location.abovebar, color.new(colBear, 60), size = size.tiny, text = "sw?")
+
+// Data-window plots — also referenced by alertcondition() placeholders {{plot("...")}}
+plot(aEntry, "Entry", color = colEntry, display = display.data_window)
+plot(aSL, "Stop Loss", color = colSL, display = display.data_window)
+plot(aT1, "Target 1", color = colTP, display = display.data_window)
+plot(aT2, "Target 2", color = colTP, display = display.data_window)
+plot(aT3, "Target 3", color = colTP, display = display.data_window)
+
+// ---------- Price tags for the latest trade's levels (5 reusable labels) ----------
+var array<label> lvlTags = array.new<label>()
+if barstate.islast
+    while lvlTags.size() > 0
+        label.delete(lvlTags.pop())
+    if showLevelLabels and showTradeLines and hasTrade and not na(lastTrade.lnEntry)
+        int   xTag  = lastTrade.active ? bar_index + 2 : lastTrade.exitBar
+        array<float>  ys  = array.from(lastTrade.entry, lastTrade.sl, lastTrade.t1, lastTrade.t2, lastTrade.t3)
+        array<string> nms = array.from("Entry", lastTrade.beActive ? "SL (BE)" : "SL", "T1 " + str.tostring(t1R) + "R", "T2 " + str.tostring(t2R) + "R", "T3 " + str.tostring(t3R) + "R")
+        array<color>  cls = array.from(colEntry, colSL, colTP, colTP, colTP)
+        for i = 0 to 4
+            lvlTags.push(label.new(xTag, ys.get(i), nms.get(i) + "  " + fmt(ys.get(i)), style = label.style_label_left, color = color.new(cls.get(i), 20), textcolor = color.white, size = size.tiny))
+
+// ---------- Dashboard ----------
+dashPos() =>
+    switch dashPosIn
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        "Middle Right" => position.middle_right
+        => position.top_right
+
+dashSize() =>
+    switch dashSizeIn
+        "Tiny"   => size.tiny
+        "Normal" => size.normal
+        => size.small
+
+rangeStatus(CRTRange r) =>
+    string s = "No range yet"
+    if not na(r.hi)
+        if not r.locked
+            s := "Building"
+        else if r.lowSwept and r.highSwept
+            s := "Active · both sides swept"
+        else if r.lowSwept
+            s := "Active · low swept"
+        else if r.highSwept
+            s := "Active · high swept"
+        else
+            s := "Active"
+    s
+
+var table dash = na
+if barstate.islast and showDashboard
+    if na(dash)
+        dash := table.new(dashPos(), 2, 16, bgcolor = color.new(#131722, 10), frame_color = color.new(#787b86, 50), frame_width = 1, border_color = color.new(#787b86, 80), border_width = 1)
+        table.merge_cells(dash, 0, 0, 1, 0)
+    string sz = dashSize()
+    color  kc = color.new(#d1d4dc, 0)
+    color  vc = color.white
+
+    string srcTxt = rangeMode == RM_HTF ? rangeMode + " (" + htfInput + ")" : rangeMode == RM_OR ? rangeMode + " (" + str.tostring(orMinutes) + "m)" : rangeMode == RM_FIRST ? rangeMode + " → " + firstCandleSize + "m" : rangeMode
+    string dirTxt = "—"
+    color  dirCol = vc
+    string statTxt = "Waiting for setup"
+    if hasTrade
+        dirTxt  := lastTrade.dir == 1 ? "BUY" : "SELL"
+        dirCol  := lastTrade.dir == 1 ? colBull : colBear
+        string hits = (lastTrade.t1Hit ? " T1✓" : "") + (lastTrade.t2Hit ? " T2✓" : "") + (lastTrade.t3Hit ? " T3✓" : "")
+        statTxt := lastTrade.active ? "CONFIRMED · active" + hits : "Closed · " + lastTrade.outcome + hits
+    if provBull or provBear
+        statTxt := statTxt + " | provisional sweep forming (unconfirmed)"
+
+    string warn = ""
+    if na(atrVal) or bar_index < pivotLeft + pivotRight + 1
+        warn := "Warming up: insufficient history"
+    else if isWindowMode and timeframe.isdwm
+        warn := "Session ranges need an intraday chart"
+    else if isOrMode and timeframe.in_seconds(timeframe.period) > orMinutesEff * 60
+        warn := "Chart TF > range window: range = first chart bar"
+    else if lastNote != ""
+        warn := lastNote
+
+    string eTxt  = "—"
+    string slTxt = "—"
+    string tTxt  = "—"
+    string rTxt  = "—"
+    if hasTrade
+        eTxt  := fmt(lastTrade.entry)
+        slTxt := fmt(lastTrade.sl) + (lastTrade.beActive ? " (BE)" : "")
+        tTxt  := fmt(lastTrade.t1) + " / " + fmt(lastTrade.t2) + " / " + fmt(lastTrade.t3)
+        rTxt  := fmt(lastTrade.risk) + " · 1:" + str.tostring(t1R) + " / 1:" + str.tostring(t2R) + " / 1:" + str.tostring(t3R)
+    table.cell(dash, 0, 0, "CRT Smart Entry Pro", text_color = vc, text_size = sz, bgcolor = color.new(colRange, 30))
+    table.cell(dash, 0, 1, "Symbol · TF", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 1, syminfo.ticker + " · " + timeframe.period, text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 2, "Range Source", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 2, srcTxt, text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 3, "Range High", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 3, fmt(rng.hi), text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 4, "Range Low", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 4, fmt(rng.lo), text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 5, "Range Mid", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 5, fmt(rng.mid), text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 6, "Range Status", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 6, rangeStatus(rng), text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 7, "Bull Setup", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 7, setupText(bullSetup), text_color = colBull, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 8, "Bear Setup", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 8, setupText(bearSetup), text_color = colBear, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 9, "Signal", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 9, dirTxt, text_color = dirCol, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 10, "Entry", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 10, eTxt, text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 11, "Stop Loss", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 11, slTxt, text_color = colSL, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 12, "T1 / T2 / T3", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 12, tTxt, text_color = colTP, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 13, "Risk · R:R", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 13, rTxt, text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 14, "Signal Status", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 14, statTxt, text_color = vc, text_size = sz, text_halign = text.align_right)
+    table.cell(dash, 0, 15, "Note", text_color = kc, text_size = sz, text_halign = text.align_left)
+    table.cell(dash, 1, 15, warn == "" ? "—" : warn, text_color = color.new(#ffb74d, 0), text_size = sz, text_halign = text.align_right)
+
+// ---------- alertcondition() — choose "Once Per Bar Close" when creating the alert ----------
+alertcondition(evBullSweep, "Bullish Liquidity Sweep", "CRT {{ticker}} ({{interval}}): Bullish liquidity sweep confirmed. Close {{close}}")
+alertcondition(evBearSweep, "Bearish Liquidity Sweep", "CRT {{ticker}} ({{interval}}): Bearish liquidity sweep confirmed. Close {{close}}")
+alertcondition(evBullMss, "Bullish MSS", "CRT {{ticker}} ({{interval}}): Bullish market structure shift. Close {{close}}")
+alertcondition(evBearMss, "Bearish MSS", "CRT {{ticker}} ({{interval}}): Bearish market structure shift. Close {{close}}")
+alertcondition(evBuy, "Confirmed BUY Signal", 'CRT BUY {{ticker}} ({{interval}}) | Entry {{plot("Entry")}} | SL {{plot("Stop Loss")}} | T1 {{plot("Target 1")}} | T2 {{plot("Target 2")}} | T3 {{plot("Target 3")}}')
+alertcondition(evSell, "Confirmed SELL Signal", 'CRT SELL {{ticker}} ({{interval}}) | Entry {{plot("Entry")}} | SL {{plot("Stop Loss")}} | T1 {{plot("Target 1")}} | T2 {{plot("Target 2")}} | T3 {{plot("Target 3")}}')
+alertcondition(evT1 or evT2 or evT3, "Target Hit", 'CRT {{ticker}} ({{interval}}): target hit. Entry {{plot("Entry")}} | T1 {{plot("Target 1")}} | T2 {{plot("Target 2")}} | T3 {{plot("Target 3")}} | Close {{close}}')
+alertcondition(evSL, "Stop Loss Hit", 'CRT {{ticker}} ({{interval}}): stop loss hit. Entry {{plot("Entry")}} | SL {{plot("Stop Loss")}} | Close {{close}}')
